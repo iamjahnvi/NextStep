@@ -1,7 +1,9 @@
 import axios from "axios";
 
 const api = axios.create({
-    baseURL: "http://localhost:5000/api/v1",
+    // VITE_API_URL in production builds; localhost fallback for local dev.
+    // No secrets here — only the public API origin.
+    baseURL: import.meta.env?.VITE_API_URL || "http://localhost:5000/api/v1",
 });
 
 api.interceptors.request.use(
@@ -47,7 +49,10 @@ export const setOnUnauthorized = (handler) => {
     onUnauthorized = typeof handler === "function" ? handler : null;
 };
 
-const AUTH_PAGES = ["/login", "/signup"];
+// Auth-adjacent pages handle their own 401s: login/signup show inline errors,
+// and /verify-email uses 401 INVALID_CODE for wrong OTPs (redirecting there
+// would destroy the verification flow). Only bounce elsewhere.
+const AUTH_PAGES = ["/login", "/signup", "/verify-email"];
 
 api.interceptors.response.use(
     (response) => response,

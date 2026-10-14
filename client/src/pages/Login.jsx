@@ -4,6 +4,7 @@ import api from "../services/api";
 import { useAuth } from "../context/useAuth";
 import PasswordInput from "../components/PasswordInput";
 import GoogleAuthButton from "../components/GoogleAuthButton";
+import { savePendingEmail } from "./verifyEmailViewModel";
 import "./Login.css";
 
 const PROMO_CHIPS = ["JEE", "NEET", "CUET", "CLAT", "+40 more"];
@@ -146,6 +147,9 @@ function Login() {
         email: "",
         _form: "",
     });
+    // Set when the backend reports EMAIL_NOT_VERIFIED: the password was right
+    // but the account is pending OTP — offer the verification path.
+    const [needsVerification, setNeedsVerification] = useState(false);
 
     // Spotlight rotation: shared by the desktop + mobile instances so they
     // stay in sync. Paused on hover/focus and never auto-advances under
@@ -224,9 +228,23 @@ function Login() {
             navigate("/main");
         } catch (error) {
             // WHY: replaced alert() with an inline error banner for clarity/UX.
+            const data = error.response?.data || {};
+            if (data.code === "EMAIL_NOT_VERIFIED") {
+                // Password correct, email pending: no token issued. Route to
+                // the OTP screen instead of leaving the user stuck.
+                const pendingEmail = (data.email || formData.email).trim().toLowerCase();
+                savePendingEmail(pendingEmail);
+                setNeedsVerification(true);
+                setErrors((prev) => ({
+                    ...prev,
+                    _form: "Please verify your email before logging in. Enter the code we sent, or resend it.",
+                }));
+                return;
+            }
+            setNeedsVerification(false);
             setErrors((prev) => ({
                 ...prev,
-                _form: error.response?.data?.message || "Login failed. Please try again.",
+                _form: data.message || "Login failed. Please try again.",
             }));
         }
     };
@@ -269,7 +287,23 @@ function Login() {
 
                         <form onSubmit={handleSubmit} autoComplete="off">
                             {errors._form && (
-                                <div className="login-form-error">{errors._form}</div>
+                                <div className="login-form-error">
+                                    {errors._form}
+                                    {needsVerification && (
+                                        <button
+                                            type="button"
+                                            className="login-signup-line__link"
+                                            style={{ marginLeft: 8 }}
+                                            onClick={() =>
+                                                navigate("/verify-email", {
+                                                    state: { email: formData.email.trim().toLowerCase() },
+                                                })
+                                            }
+                                        >
+                                            Verify now →
+                                        </button>
+                                    )}
+                                </div>
                             )}
 
                             <div className="login-field">

@@ -1,9 +1,9 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import api from "../services/api";
-import { useAuth } from "../context/useAuth";
 import PasswordInput from "../components/PasswordInput";
 import GoogleAuthButton from "../components/GoogleAuthButton";
+import { savePendingEmail } from "./verifyEmailViewModel";
 import "./Signup.css";
 
 const BENEFITS = [
@@ -59,7 +59,8 @@ const validateField = (value, type) => {
 
 function Signup() {
     const navigate = useNavigate();
-    const { login } = useAuth();
+
+    const [submitting, setSubmitting] = useState(false);
 
     const [formData, setFormData] = useState({
         name: "",
@@ -133,41 +134,63 @@ function Signup() {
             return;
         }
 
+        // Duplicate-submission guard: signup initiation sends an email, so a
+        // double click must not fire twice.
+        if (submitting) return;
+        setSubmitting(true);
+
         try {
             const response = await api.post("/auth/signup", formData);
-            if (response.data.success) {
-                // Signup issues no JWT (existing contract), so authenticate
-                // immediately with the same credentials to establish the
-                // shared session — no backend change needed.
-                try {
-                    const loginResponse = await api.post("/auth/login", {
-                        email: formData.email,
-                        password: formData.password,
-                    });
-                    await login(loginResponse.data.token);
-                    navigate("/main");
-                } catch {
-                    // Auto-login failed (edge case): fall back to manual login.
-                    navigate("/login");
-                }
+            if (response.data.success || response.data.code === "VERIFICATION_REQUIRED") {
+                // Signup issues NO token — the account is pending until the
+                // emailed code is verified. Hand off to the OTP screen with
+                // the address only (never credentials, never a token).
+                const email = (response.data.email || formData.email).trim().toLowerCase();
+                savePendingEmail(email);
+                navigate("/verify-email", {
+                    state: {
+                        email,
+                        expiresInMinutes: response.data.expiresInMinutes || 10,
+                        emailSent: response.data.emailSent !== false,
+                    },
+                });
+                return;
             }
         } catch (error) {
             // WHY: replaced alert() with inline error display for clarity/UX.
+            const data = error.response?.data || {};
+            // Stable backend codes drive the copy — never message matching.
+            // EMAIL_ALREADY_REGISTERED points at login; anything pending
+            // verification resumes on the OTP screen.
+            if (data.code === "EMAIL_ALREADY_REGISTERED") {
+                setErrors((prev) => ({
+                    ...prev,
+                    _form: "An account with this email already exists. Please log in instead.",
+                }));
+                return;
+            }
+            if (data.code === "EMAIL_NOT_VERIFIED" && data.email) {
+                savePendingEmail(data.email);
+                navigate("/verify-email", { state: { email: data.email } });
+                return;
+            }
             const serverMessage =
-                error.response?.data?.message ||
-                error.response?.data?.errors?.email ||
-                error.response?.data?.errors?.password ||
-                error.response?.data?.errors?.name ||
+                data.message ||
+                data.errors?.email ||
+                data.errors?.password ||
+                data.errors?.name ||
                 error.message ||
                 "Signup failed";
 
             setErrors((prev) => ({
                 ...prev,
-                email: error.response?.data?.errors?.email || "",
-                password: error.response?.data?.errors?.password || "",
-                name: error.response?.data?.errors?.name || "",
+                email: data.errors?.email || "",
+                password: data.errors?.password || "",
+                name: data.errors?.name || "",
                 _form: serverMessage,
             }));
+        } finally {
+            setSubmitting(false);
         }
     };
 
@@ -326,8 +349,8 @@ function Signup() {
                                 )}
                             </div>
 
-                            <button type="submit" className="signup-btn-primary">
-                                Create account
+                            <button type="submit" className="signup-btn-primary" disabled={submitting}>
+                                {submitting ? "Creating account…" : "Create account"}
                             </button>
 
                             <p className="signup-form-footer">

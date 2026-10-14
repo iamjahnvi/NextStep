@@ -3,6 +3,7 @@ import{Routes , Route } from "react-router-dom";
 import Home from "./pages/Home";
 import Signup from "./pages/Signup";
 import Login from "./pages/Login";
+import VerifyEmail from "./pages/VerifyEmail";
 import Profile from "./pages/Profile";
 import MainPage from "./pages/MainPage";
 import Recommendations from "./pages/Recommendations";
@@ -18,6 +19,7 @@ function App(){
         <Route path="/" element={<Home />}></Route>
         <Route path="/signup" element={<Signup />}></Route>
         <Route path="/login" element={<Login />}></Route>
+        <Route path="/verify-email" element={<VerifyEmail />}></Route>
         <Route path="/profile" element={<ProtectedRoute><Profile/></ProtectedRoute>}></Route>
         <Route path="/main" element={<ProtectedRoute><MainPage /></ProtectedRoute>}></Route>
         <Route path="/exams/:id" element={<ProtectedRoute><ExamDetails /></ProtectedRoute>}></Route>
