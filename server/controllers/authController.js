@@ -45,6 +45,88 @@ const {
 } = require("../utils/educationLevels");
 
 const {
+    normalizeEmail,
+    generateOtp,
+    hashOtp,
+    verifyOtpHash,
+    isWellFormedOtp,
+    getOtpConfig,
+} = require("../utils/otp");
+
+const { sendVerificationOtp } = require("../services/mailer");
+
+// -----------------------------------------------------------------------------
+// EMAIL-OTP VERIFICATION — shared account-lifecycle helpers
+// SCOPE: new email/password sign-ups ONLY. Google accounts are provider-
+//   verified; legacy documents (isEmailVerified missing) predate this flow.
+//   A MISSING flag therefore counts as verified so existing users are never
+//   locked out. Only an explicit `false` on a non-Google account is pending.
+// -----------------------------------------------------------------------------
+const isAccountVerified = (user) => {
+    if (!user) return false;
+    if (user.googleId) return true;
+    if (user.isEmailVerified === undefined || user.isEmailVerified === null) return true;
+    return user.isEmailVerified === true;
+};
+
+// Attach a fresh OTP (invalidating any prior code) to a user document.
+// Returns the PLAINTEXT code + ttl for the single sendMail call — callers must
+// never log, return, or store it beyond that call.
+const issueFreshOtp = (user) => {
+    const config = getOtpConfig();
+    const code = generateOtp(config.length);
+    const now = new Date();
+    user.emailVerification = {
+        otpHash: hashOtp(code),
+        expiresAt: new Date(now.getTime() + config.ttlMinutes * 60000),
+        attempts: 0,
+        lastSentAt: now,
+        resendCount: 0,
+        resendWindowStart: now,
+        consumedAt: undefined,
+        purpose: "email-verification",
+    };
+    user.isEmailVerified = false;
+    return { code, ttlMinutes: config.ttlMinutes };
+};
+
+// Send the code; on failure the pending account is preserved and the caller
+// reports emailSent:false WITHOUT claiming delivery. Never throws for mail
+// failures — returns a { mailed, code, message } outcome instead.
+const deliverOtp = async (email, code, ttlMinutes) => {
+    try {
+        await sendVerificationOtp({ to: email, code, ttlMinutes });
+        return { mailed: true, code: "OTP_SENT", message: "Verification code sent." };
+    } catch (mailError) {
+        if (mailError.code === "RECIPIENT_NOT_VERIFIED") {
+            return {
+                mailed: false,
+                code: "RECIPIENT_NOT_VERIFIED",
+                message:
+                    "We could not deliver the code to this address yet (mail service restriction). " +
+                    "Try a different address or use Resend once delivery is enabled.",
+            };
+        }
+        if (mailError.code === "EMAIL_NOT_CONFIGURED") {
+            return {
+                mailed: false,
+                code: "EMAIL_SEND_FAILED",
+                message:
+                    "Email delivery is not configured right now. Your account is saved — " +
+                    "use Resend code to try again later.",
+            };
+        }
+        return {
+            mailed: false,
+            code: "EMAIL_SEND_FAILED",
+            message:
+                "We could not send the verification email. Your account is saved — " +
+                "use Resend code to try again.",
+        };
+    }
+};
+
+const {
     normalizeStream,
     normalizeUserSubjects,
     CANONICAL_STREAMS,
@@ -86,7 +168,11 @@ const signup = async (req , res) => {
         // WHY: Prevents malformed email addresses (e.g. "abc@", "user@.com")
         //   from being created in the database.
         // ---------------------------------------------------------------------
-        const emailCheck = validateEmail(email);
+        // Normalize once (trim + lowercase) so lookups, storage, and OTP
+        // binding all use the identical address. Schema lowercase:true only
+        // lowercases on save — lookups must use the normalized form.
+        const normalizedEmail = normalizeEmail(email);
+        const emailCheck = validateEmail(normalizedEmail);
         if(!emailCheck.valid){
             return res.status(400).json({
                 success : false ,
@@ -124,7 +210,7 @@ const signup = async (req , res) => {
             });
         }
 
-        const existingUser = await User.findOne({email});
+        const existingUser = await User.findOne({ email: normalizedEmail });
 
         // findOne tells MongoDB: "Search through the collection and return the very first document that matches the criteria I give you." Even if there are multiple users with the same criteria, it stops searching after finding the first match. If it finds nothing, it returns null.
 
@@ -136,35 +222,94 @@ const signup = async (req , res) => {
         // email is the variable holding the actual email.
 
 
-        if(existingUser){
+        // -------------------------------------------------------------
+        // OTP lifecycle: verified accounts keep the existing 409; pending
+        // (unverified) accounts take the safe recovery path — refresh the
+        // credentials to the latest attempt, invalidate the prior code, and
+        // re-send. Verified accounts, passwords, Google identity and profile
+        // are never overwritten here.
+        // -------------------------------------------------------------
+        if(existingUser && isAccountVerified(existingUser)){
             return res.status(409).json({
                 success : false ,
-                message : "Email already exists"
+                code : "EMAIL_ALREADY_REGISTERED" ,
+                message : "An account with this email already exists. Please log in instead."
             })
         }
+
         const hashedPassword = await bcrypt.hash(password,10);
 
 
         // bcrypt : a popular , battle-tested npm package(library) used for securely hashing passwords.
 
         // explaination : bcrypt is not built into Node.js; it is an external dependency that implements the Bcrypt password-hashing function . It is specifically engineered to be slow and computationally expensive.
-        
-        const user = await User.create({
+
+        const createPendingUser = async () => User.create({
             name ,
-            email , 
+            email : normalizedEmail ,
             password : hashedPassword,
+            isEmailVerified : false,
         });
 
-        return res.status(201).json({
-            success : true,
-            message : "User registered successfully" ,
-            user : {
-                id: user._id,
-                name: user.name ,
-                email: user.email,
-            },
-        });
+        let user;
+        let isRetry = false;
+        if(existingUser){
+            // Pending account retry: adopt the latest name/password (the user
+            // may be correcting a typo) but touch nothing else.
+            isRetry = true;
+            existingUser.name = name;
+            existingUser.password = hashedPassword;
+            user = existingUser;
+        } else {
+            try {
+                user = await createPendingUser();
+            } catch (createError) {
+                // Concurrent signup race: another request created the address
+                // first. Recover via the same pending/verified branches instead
+                // of failing with a 500 duplicate-key error.
+                if(createError && createError.code === 11000){
+                    const racedUser = await User.findOne({ email: normalizedEmail });
+                    if(racedUser && isAccountVerified(racedUser)){
+                        return res.status(409).json({
+                            success : false ,
+                            code : "EMAIL_ALREADY_REGISTERED" ,
+                            message : "An account with this email already exists. Please log in instead."
+                        });
+                    }
+                    if(racedUser){
+                        isRetry = true;
+                        racedUser.name = name;
+                        racedUser.password = hashedPassword;
+                        user = racedUser;
+                    } else {
+                        throw createError;
+                    }
+                } else {
+                    throw createError;
+                }
+            }
+        }
+
+        // Issue (or re-issue) the OTP — this invalidates any prior code so
+        // only the latest code can verify. No JWT is issued at this stage.
+        const { code: otpCode, ttlMinutes } = issueFreshOtp(user);
+        await user.save();
+        const delivery = await deliverOtp(normalizedEmail, otpCode, ttlMinutes);
+
         // we respond with successful creation of profile of person, only after the data of the user has been saved in mongodb , otherwise if lessay , database is down , it would catch error , and hence print internal server issue.
+        return res.status(isRetry ? 200 : 201).json({
+            success : true,
+            code : "VERIFICATION_REQUIRED",
+            message : delivery.mailed
+                ? (isRetry
+                    ? "A fresh verification code was sent to your email."
+                    : "Account created. A verification code was sent to your email.")
+                : delivery.message,
+            emailSent : delivery.mailed,
+            email : user.email,
+            expiresInMinutes : ttlMinutes,
+            ...(delivery.mailed ? {} : { emailErrorCode : delivery.code }),
+        });
     } catch(error) {
         console.log(error);
 
@@ -177,16 +322,26 @@ const signup = async (req , res) => {
 
 const getMe = async (req , res) => {
     try{
+        // Explicit safe projection: never return password hashes or OTP state.
+        const user = req.user;
         return res.status(200).json({
-            success : true , 
-            user : req.user,
+            success : true ,
+            user : {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                avatar: user.avatar,
+                isEmailVerified: isAccountVerified(user),
+                profile: user.profile,
+            },
         });
     } catch(error) {
     console.error(error);
 
     res.status(500).json({
         success : false ,
-        messgae : "Internal Server error"
+        code : "INTERNAL_ERROR" ,
+        message : "Internal Server error"
     });
 }
 } 
@@ -214,17 +369,30 @@ const login = async (req,res) => {
         if(!emailCheck.valid){
             return res.status(400).json({
                 success : false ,
+                code : "VALIDATION_ERROR" ,
                 errors : { email : emailCheck.message },
             });
         }
 
-        const user = await User.findOne({email});
+        const normalizedEmail = normalizeEmail(email);
+        const user = await User.findOne({ email: normalizedEmail });
 
         if(!user){
             return res.status(401).json({
                 success : false  , 
+                code : "INVALID_CREDENTIALS" ,
                 message : "Invalid email or password"
             })
+        }
+
+        if(!user.password){
+            // Defensive: manually-created documents without a password hash
+            // must fail closed instead of crashing bcrypt.compare.
+            return res.status(401).json({
+                success : false ,
+                code : "INVALID_CREDENTIALS" ,
+                message : "Invalid email or password"
+            });
         }
 
         const isPasswordCorrect = await bcrypt.compare(
@@ -234,8 +402,21 @@ const login = async (req,res) => {
         if(!isPasswordCorrect){
             return res.status(401).json({
                 success : false ,
+                code : "INVALID_CREDENTIALS" ,
                 message : "Invalid email or password"
             })
+        }
+
+        // Unverified password accounts get NO token — the frontend routes
+        // them to the verification/resend flow via this stable code.
+        // (Checked after the password so wrong passwords stay generic.)
+        if(!isAccountVerified(user)){
+            return res.status(403).json({
+                success : false ,
+                code : "EMAIL_NOT_VERIFIED" ,
+                message : "Please verify your email before logging in. Enter the code we sent, or resend it.",
+                email : user.email,
+            });
         }
 
         const token = generateToken(user._id);
@@ -248,6 +429,7 @@ const login = async (req,res) => {
                 id : user._id,
                 name : user.name ,
                 email : user.email ,
+                isEmailVerified : isAccountVerified(user) ,
 
             } ,
         });
@@ -348,7 +530,8 @@ const googleAuth = async (req , res) => {
         let user = await User.findOne({ email });
 
         if(!user){
-            // first time -> auto register (signup via Google)
+            // first time -> auto register (signup via Google). Google emails
+            // are provider-verified, so no OTP flow applies.
             const randomPassword = crypto.randomBytes(32).toString("hex");
             const hashedPassword = await bcrypt.hash(randomPassword, 10);
             user = await User.create({
@@ -357,11 +540,22 @@ const googleAuth = async (req , res) => {
                 password : hashedPassword ,
                 googleId : payload.sub ,
                 avatar : picture ,
+                isEmailVerified : true ,
             });
         } else {
-            // existing user -> just log in (and refresh their stored googleId/avatar)
+            // existing user -> just log in (and refresh their stored googleId/avatar).
+            // Google just proved ownership of this address, so any pending
+            // password-OTP state is resolved as verified — profile/password
+            // are otherwise untouched.
             if(payload.sub && !user.googleId) user.googleId = payload.sub;
             if(picture && !user.avatar) user.avatar = picture;
+            if(!isAccountVerified(user)) user.isEmailVerified = true;
+            if(user.emailVerification && (user.emailVerification.otpHash || user.emailVerification.expiresAt)){
+                user.emailVerification.otpHash = undefined;
+                user.emailVerification.expiresAt = undefined;
+                user.emailVerification.attempts = 0;
+                user.emailVerification.consumedAt = new Date();
+            }
             await user.save();
         }
 
@@ -381,6 +575,287 @@ const googleAuth = async (req , res) => {
         });
     }
 }
+// -----------------------------------------------------------------------------
+// verifyOtp — POST /auth/verify-otp { email, code }
+// HOW: The code is compared (timing-safe) against the stored hash; on success
+//   the account is marked verified and consumed ATOMICALLY via a guarded
+//   findOneAndUpdate, so concurrent requests cannot double-consume the code.
+//   Only then is the normal JWT issued using existing conventions.
+// WHY: This is the single gate that turns a pending account into a session.
+// -----------------------------------------------------------------------------
+const verifyOtp = async (req, res) => {
+    try{
+        const { email, code } = req.body || {};
+        if(!email || !code){
+            return res.status(400).json({
+                success : false ,
+                code : "VALIDATION_ERROR" ,
+                message : "Email and verification code are required.",
+            });
+        }
+        const normalizedEmail = normalizeEmail(email);
+        const emailCheck = validateEmail(normalizedEmail);
+        if(!emailCheck.valid){
+            return res.status(400).json({
+                success : false ,
+                code : "VALIDATION_ERROR" ,
+                errors : { email : emailCheck.message },
+            });
+        }
+        if(!isWellFormedOtp(String(code).trim())){
+            return res.status(400).json({
+                success : false ,
+                code : "INVALID_CODE" ,
+                message : "Enter the 6-digit verification code from your email.",
+            });
+        }
+        const trimmedCode = String(code).trim();
+
+        const user = await User.findOne({ email: normalizedEmail })
+            .select("+emailVerification.otpHash");
+
+        // Idempotent replays: already-verified accounts succeed WITHOUT a new
+        // token — the user should log in normally. Checked BEFORE the OTP
+        // presence check because success consumes (unsets) the OTP state.
+        if(user && isAccountVerified(user)){
+            return res.status(200).json({
+                success : false ,
+                code : "ALREADY_VERIFIED" ,
+                message : "This email is already verified. Please log in.",
+            });
+        }
+
+        if(!user || !user.emailVerification || !user.emailVerification.otpHash){
+            return res.status(404).json({
+                success : false ,
+                code : "NO_PENDING_VERIFICATION" ,
+                message : "No pending verification for this email. Sign up again or resend the code.",
+            });
+        }
+
+        const config = getOtpConfig();
+        const verification = user.emailVerification;
+
+        if(verification.consumedAt){
+            return res.status(400).json({
+                success : false ,
+                code : "INVALID_CODE" ,
+                message : "This code has already been used. Resend a new code to continue.",
+            });
+        }
+
+        if(!verification.expiresAt || verification.expiresAt.getTime() <= Date.now()){
+            return res.status(400).json({
+                success : false ,
+                code : "EXPIRED_CODE" ,
+                message : "This code has expired. Resend a new code to continue.",
+            });
+        }
+
+        if((verification.attempts || 0) >= config.maxAttempts){
+            return res.status(403).json({
+                success : false ,
+                code : "TOO_MANY_ATTEMPTS" ,
+                message : "Too many incorrect attempts. Resend a new code to continue.",
+            });
+        }
+
+        if(!verifyOtpHash(trimmedCode, verification.otpHash)){
+            const updated = await User.findOneAndUpdate(
+                { _id: user._id },
+                { $inc : { "emailVerification.attempts" : 1 } },
+                { returnDocument : "after" }
+            );
+            const attemptsLeft = Math.max(
+                0,
+                config.maxAttempts - ((updated && updated.emailVerification && updated.emailVerification.attempts) || 0)
+            );
+            return res.status(401).json({
+                success : false ,
+                code : "INVALID_CODE" ,
+                message : attemptsLeft > 0
+                    ? `Incorrect code. ${attemptsLeft} attempt${attemptsLeft === 1 ? "" : "s"} left before you need a new code.`
+                    : "Incorrect code. Resend a new code to continue.",
+                attemptsLeft,
+            });
+        }
+
+        // Correct code: atomically verify + consume, guarded on the exact hash
+        // so a concurrent request (or a resend that superseded this code)
+        // cannot also succeed.
+        const consumed = await User.findOneAndUpdate(
+            {
+                _id: user._id,
+                "emailVerification.otpHash": verification.otpHash,
+                "emailVerification.consumedAt": { $exists: false },
+            },
+            {
+                $set: {
+                    isEmailVerified: true,
+                    "emailVerification.consumedAt": new Date(),
+                    "emailVerification.attempts": 0,
+                },
+                $unset: {
+                    "emailVerification.otpHash": "",
+                    "emailVerification.expiresAt": "",
+                },
+            },
+            { returnDocument: "after" }
+        );
+
+        if(!consumed){
+            const fresh = await User.findById(user._id);
+            if(fresh && isAccountVerified(fresh)){
+                return res.status(200).json({
+                    success : false ,
+                    code : "ALREADY_VERIFIED" ,
+                    message : "This email is already verified. Please log in.",
+                });
+            }
+            return res.status(400).json({
+                success : false ,
+                code : "INVALID_CODE" ,
+                message : "This code is no longer valid. Resend a new code to continue.",
+            });
+        }
+
+        const token = generateToken(consumed._id);
+        return res.status(200).json({
+            success : true ,
+            code : "VERIFIED" ,
+            message : "Email verified successfully. Welcome to NextStep!",
+            token,
+            user : {
+                id : consumed._id,
+                name : consumed.name,
+                email : consumed.email,
+            },
+        });
+    } catch(error){
+        console.log(error);
+        return res.status(500).json({
+            success : false ,
+            code : "INTERNAL_ERROR" ,
+            message : "Internal server error",
+        });
+    }
+};
+
+// -----------------------------------------------------------------------------
+// resendOtp — POST /auth/resend-otp { email }
+// HOW: Enforces a per-email cooldown + hourly cap, then invalidates the prior
+//   code by issuing a fresh OTP. Failed delivery never claims success.
+// WHY: Recovery path for expired/lost codes and for users returning later.
+// -----------------------------------------------------------------------------
+const resendOtp = async (req, res) => {
+    try{
+        const { email } = req.body || {};
+        if(!email){
+            return res.status(400).json({
+                success : false ,
+                code : "VALIDATION_ERROR" ,
+                message : "Email is required.",
+            });
+        }
+        const normalizedEmail = normalizeEmail(email);
+        const emailCheck = validateEmail(normalizedEmail);
+        if(!emailCheck.valid){
+            return res.status(400).json({
+                success : false ,
+                code : "VALIDATION_ERROR" ,
+                errors : { email : emailCheck.message },
+            });
+        }
+
+        const user = await User.findOne({ email: normalizedEmail });
+        if(!user){
+            return res.status(404).json({
+                success : false ,
+                code : "NO_PENDING_VERIFICATION" ,
+                message : "No pending verification for this email. Sign up again to receive a code.",
+            });
+        }
+        if(isAccountVerified(user)){
+            return res.status(200).json({
+                success : false ,
+                code : "ALREADY_VERIFIED" ,
+                message : "This email is already verified. Please log in.",
+            });
+        }
+
+        const config = getOtpConfig();
+        const verification = user.emailVerification || {};
+        const now = new Date();
+
+        if(
+            verification.lastSentAt &&
+            now.getTime() - verification.lastSentAt.getTime() <
+                config.resendCooldownSeconds * 1000
+        ){
+            const retryAfterSeconds = Math.ceil(
+                (config.resendCooldownSeconds * 1000 -
+                    (now.getTime() - verification.lastSentAt.getTime())) / 1000
+            );
+            return res.status(429).json({
+                success : false ,
+                code : "RESEND_COOLDOWN" ,
+                message : `A code was just sent. Please wait ${retryAfterSeconds}s before requesting another.`,
+                retryAfterSeconds,
+            });
+        }
+
+        // Hourly resend budget (sliding window).
+        let resendCount = verification.resendCount || 0;
+        if(
+            !verification.resendWindowStart ||
+            now.getTime() - verification.resendWindowStart.getTime() > 60 * 60 * 1000
+        ){
+            resendCount = 0;
+            user.emailVerification.resendWindowStart = now;
+        }
+        if(resendCount >= config.maxResendsPerHour){
+            return res.status(429).json({
+                success : false ,
+                code : "RESEND_LIMIT_REACHED" ,
+                message : "Too many code requests. Please try again later.",
+            });
+        }
+
+        const { code: otpCode, ttlMinutes } = issueFreshOtp(user);
+        user.emailVerification.resendCount = resendCount + 1;
+        user.emailVerification.resendWindowStart =
+            user.emailVerification.resendWindowStart || now;
+        await user.save();
+
+        const delivery = await deliverOtp(normalizedEmail, otpCode, ttlMinutes);
+        if(!delivery.mailed){
+            const status = delivery.code === "RECIPIENT_NOT_VERIFIED" ? 502 : 502;
+            return res.status(status).json({
+                success : false ,
+                code : delivery.code ,
+                message : delivery.message,
+                emailSent : false,
+            });
+        }
+
+        return res.status(200).json({
+            success : true ,
+            code : "OTP_SENT" ,
+            message : "A new verification code was sent to your email.",
+            emailSent : true,
+            email : user.email,
+            expiresInMinutes : ttlMinutes,
+        });
+    } catch(error){
+        console.log(error);
+        return res.status(500).json({
+            success : false ,
+            code : "INTERNAL_ERROR" ,
+            message : "Internal server error",
+        });
+    }
+};
+
 const updateProfile = async(req , res) => {
     try {
         const {
@@ -539,6 +1014,7 @@ const updateProfile = async(req , res) => {
                 name: req.user.name,
                 email: req.user.email,
                 avatar: req.user.avatar,
+                isEmailVerified: isAccountVerified(req.user),
                 age: req.user.profile.age,
                 dateOfBirth: req.user.profile.dateOfBirth,
                 gender: req.user.profile.gender,
@@ -565,5 +1041,8 @@ module.exports = {
     updateProfile ,
     getGoogleConfig ,
     googleAuth ,
+    verifyOtp ,
+    resendOtp ,
+    isAccountVerified ,
 };
 

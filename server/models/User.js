@@ -22,6 +22,32 @@ const userSchema = new mongoose.Schema({
         minlength : 0,
     } ,
 
+    // Email verification (OTP flow for email/password sign-ups only).
+    // WHY: a new password account must prove it owns the address before it
+    //   receives a session. Legacy documents predate this field — a MISSING
+    // value is treated as verified (see authController/protect), so existing
+    // users are never locked out. There is deliberately NO default here: a
+    // Mongoose default would be applied on READ to legacy documents missing
+    // the field, wrongly flipping them to unverified. All creation paths set
+    // this explicitly (signup=false, Google=true).
+    // Google accounts are provider-verified and always treated as verified
+    // regardless of this flag.
+    isEmailVerified: {
+        type: Boolean,
+    },
+    // emailVerification holds ONLY the hash of the latest OTP plus control
+    // metadata. Plaintext codes are never stored. otpHash is select:false so
+    // normal queries never load it into API responses.
+    emailVerification: {
+        otpHash: { type: String, select: false },
+        expiresAt: { type: Date },
+        attempts: { type: Number, default: 0 },
+        lastSentAt: { type: Date },
+        resendCount: { type: Number, default: 0 },
+        resendWindowStart: { type: Date },
+        consumedAt: { type: Date },
+        purpose: { type: String, default: "email-verification" },
+    },
     // Google OAuth fields — only set when the user signs in via Google.
     // googleId: Google's unique ID for the account (audience/obfuscated sub).
     // avatar: profile picture URL returned by Google.
@@ -78,6 +104,16 @@ const userSchema = new mongoose.Schema({
     // updatedAt
     
 });
+
+// NEVER expose password hashes or OTP hashes through JSON. Controllers also
+// project safe fields explicitly; this is defense-in-depth.
+const stripSensitive = (doc, ret) => {
+    delete ret.password;
+    if (ret.emailVerification) delete ret.emailVerification.otpHash;
+    return ret;
+};
+userSchema.set("toJSON", { transform: stripSensitive });
+userSchema.set("toObject", { transform: stripSensitive });
 
 const User = mongoose.model('User', userSchema);
 // creation of a model

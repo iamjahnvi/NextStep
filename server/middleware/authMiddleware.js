@@ -25,8 +25,31 @@ const protect = async (req , res , next) => {
         );
         // verifying token
 
-        const user = await User.findById(decoded.id).select("-password");
+        // otpHash stays out of the session object (select:false anyway) and
+        // the password hash is never attached to req.user.
+        const user = await User.findById(decoded.id).select("-password -emailVerification.otpHash");
         // find user , and select everything except password.
+
+        if(!user){
+            // Token belongs to a deleted/missing account: fail closed instead
+            // of passing a null user down the chain.
+            return res.status(401).json({
+                success : false ,
+                code : "USER_NOT_FOUND" ,
+                message : "Not authorized , token failed"
+            });
+        }
+
+        // Unverified password accounts hold no valid session for protected
+        // APIs (they never receive a JWT, but this blocks any forged/legacy
+        // token too). Google-linked and legacy (flag missing) accounts pass.
+        if(!user.googleId && user.isEmailVerified === false){
+            return res.status(403).json({
+                success : false ,
+                code : "EMAIL_NOT_VERIFIED" ,
+                message : "Please verify your email before continuing.",
+            });
+        }
 
         req.user = user;
         // attach user to req.user
