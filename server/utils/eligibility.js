@@ -273,13 +273,88 @@ const isProfileComplete = (profile) => {
     return { complete: missing.length === 0, missing };
 };
 
-const examMatchesEducation = (examMinimumEducationLevel, userEducationLevel) => {
-    const examRank = getEducationRank(examMinimumEducationLevel);
-    // No confirmed education bar on the exam -> criterion not evaluated.
-    if (examRank === null) return true;
+const examMatchesEducation = (exam, userEducationLevel) => {
+    // exam: exam-like object { minimumEducationLevel, maximumEducationLevel,
+    //   noUpperEducationLimit, alternativeQualifications }. Preferred form —
+    //   enforces the range in BOTH directions (see describeEducation below).
+    // Legacy scalar form (a bare minimum level) keeps minimum-only semantics
+    // for backward compatibility with older callers; all endpoints use the
+    // object form via isEligibleForExam.
+    if (exam === null || exam === undefined || typeof exam !== "object") {
+        const examRank = getEducationRank(exam);
+        if (examRank === null) return true;
+        const userRank = getEducationRank(userEducationLevel);
+        if (userRank === null) return false;
+        return userRank >= examRank;
+    }
+    const described = describeEducationEligibility(exam);
+    if (described.state === "CONTRADICTORY" || described.state === "UNKNOWN") return false;
     const userRank = getEducationRank(userEducationLevel);
     if (userRank === null) return false;
-    return userRank >= examRank;
+    // Minimum side: below the bar is out, unless an explicitly accepted
+    // alternative pathway covers the student's own level.
+    if (described.minRank !== null && userRank < described.minRank) {
+        const canonicalUser = normalizeEducationLevel(userEducationLevel);
+        if (!canonicalUser || !described.alternatives.includes(canonicalUser)) return false;
+    }
+    // Maximum side: above an explicit cap is out. Alternatives never override
+    // a cap (pathways widen entry, they do not lift ceilings).
+    if (described.maxRank !== null && userRank > described.maxRank) return false;
+    return true;
+};
+
+// Classifies an exam's education requirements WITHOUT deciding eligibility:
+//   BOUNDED  — min and/or max known (unknown side defaults only when the
+//              other side is explicit: min-only needs noUpperEducationLimit,
+//              max-only needs no minimum... see below).
+//   OPEN     — a known floor with an explicitly unrestricted upper
+//              (noUpperEducationLimit === true).
+//   UNKNOWN  — no evaluable floor (no known minimum AND no usable
+//              alternative pathways) or no explicit upper semantics.
+//   CONTRADICTORY — min and max both known but max ranks below min.
+// A missing maximum is NEVER read as "everyone eligible" or "nobody
+// eligible": it is UNKNOWN unless noUpperEducationLimit is explicitly true.
+const describeEducationEligibility = (exam) => {
+    const source = exam && typeof exam === "object" ? exam : {};
+    const minRank = getEducationRank(source.minimumEducationLevel);
+    const maxRank = getEducationRank(source.maximumEducationLevel);
+    const upperOpen = source.noUpperEducationLimit === true;
+    const alternatives = normalizeAlternativeQualifications(source.alternativeQualifications);
+    const minKnown = minRank !== null;
+    const maxKnown = maxRank !== null;
+    if (minKnown && maxKnown && maxRank < minRank) {
+        return { state: "CONTRADICTORY", minRank, maxRank, upperOpen, alternatives };
+    }
+    // Evaluable floor: a known minimum, or usable alternative pathways.
+    if (!minKnown && alternatives.length === 0) {
+        return { state: "UNKNOWN", minRank, maxRank, upperOpen, alternatives };
+    }
+    // Upper side must be explicit: a known cap, or an explicit "no cap".
+    if (!maxKnown && !upperOpen) {
+        return { state: "UNKNOWN", minRank, maxRank, upperOpen, alternatives };
+    }
+    if (maxKnown) {
+        return { state: "BOUNDED", minRank, maxRank, upperOpen, alternatives };
+    }
+    return { state: "OPEN", minRank, maxRank, upperOpen, alternatives };
+};
+
+// Canonical alternative levels accepted as entry pathways (e.g. Diploma for
+// lateral-entry exams). Unrecognized entries are dropped for evaluation —
+// free-text nuance stays in customEligibility/display, never in matching.
+const normalizeAlternativeQualifications = (value) => {
+    const list = Array.isArray(value) ? value : (value === undefined || value === null ? [] : [value]);
+    const seen = new Set();
+    const out = [];
+    for (const entry of list) {
+        const canonical = normalizeEducationLevel(entry);
+        if (canonical === null) continue;
+        if (!seen.has(canonical)) {
+            seen.add(canonical);
+            out.push(canonical);
+        }
+    }
+    return out;
 };
 
 const examMatchesPercentage = (exam, userPercentage) => {
@@ -350,7 +425,9 @@ const isEligibleForExam = (exam, profile) => {
     // are display-only until a future implementation wires them in — they
     // must never silently filter anyone out.
     if (!exam || !profile) return false;
-    if (!examMatchesEducation(exam.minimumEducationLevel, profile.educationLevel)) return false;
+    // Education is evaluated bidirectionally from the whole exam record
+    // (minimum AND maximum/alternatives) — never minimum-only.
+    if (!examMatchesEducation(exam, profile.educationLevel)) return false;
     if (!examMatchesStream(exam.streams, profile.stream)) return false;
     if (!examMatchesPercentage(exam, profile.percentage)) return false;
     if (!examMatchesAge(exam, getAgeFromProfile(profile))) return false;
@@ -375,6 +452,8 @@ module.exports = {
     userMatchesExamSubjects,
     isProfileComplete,
     examMatchesEducation,
+    describeEducationEligibility,
+    normalizeAlternativeQualifications,
     examMatchesPercentage,
     examMatchesAge,
     calculateAgeFromDOB,

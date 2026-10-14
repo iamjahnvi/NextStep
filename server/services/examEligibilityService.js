@@ -12,8 +12,9 @@
 // CONTRACT (pure document mutation — no DB I/O here, callers save):
 //   applyManualEligibility(examDoc, { field, value, updatedBy, note })
 //     field: "streams" | "subjects" | "minimumAge" | "maximumAge" |
-//            "minimumEducationLevel" | "description" |
-//            "eligibility.<commonField>" (see MANUAL_ELIGIBILITY_FIELDS).
+//            "minimumEducationLevel" | "maximumEducationLevel" |
+//            "noUpperEducationLimit" | "alternativeQualifications" |
+//            "description" | "eligibility.<commonField>" (see MANUAL_ELIGIBILITY_FIELDS).
 //     value: the corrected value (null clears back to "no confirmed value").
 //     Throws on unknown fields, mistyped values, or unrecognised education
 //     levels — UNKNOWN is expressed as null, never as a guessed string.
@@ -34,6 +35,7 @@
 // =============================================================================
 
 const { normalizeEducationLevel } = require("../utils/educationLevels");
+const { normalizeAlternativeQualifications } = require("../utils/eligibility");
 
 const MANUAL_TOP_LEVEL_FIELDS = [
     "streams",
@@ -41,6 +43,9 @@ const MANUAL_TOP_LEVEL_FIELDS = [
     "minimumAge",
     "maximumAge",
     "minimumEducationLevel",
+    "maximumEducationLevel",
+    "noUpperEducationLimit",
+    "alternativeQualifications",
     "description",
 ];
 
@@ -122,10 +127,35 @@ const normalizeManualValue = (field, value) => {
             }
             return { ok: true, value: num };
         }
-        case "minimumEducationLevel": {
-            if (typeof value !== "string") return { ok: false };
+        case "minimumEducationLevel":
+        case "maximumEducationLevel": {
+            if (typeof value !== "string" && typeof value !== "number") return { ok: false };
             const canonical = normalizeEducationLevel(value);
             return canonical ? { ok: true, value: canonical } : { ok: false };
+        }
+        case "noUpperEducationLimit": {
+            // Explicit booleans only (plus "true"/"false" strings from forms).
+            // null clears back to "not established".
+            if (typeof value === "boolean") return { ok: true, value };
+            if (typeof value === "string") {
+                const lower = value.trim().toLowerCase();
+                if (lower === "true") return { ok: true, value: true };
+                if (lower === "false") return { ok: true, value: false };
+            }
+            return { ok: false };
+        }
+        case "alternativeQualifications": {
+            if (!Array.isArray(value)) return { ok: false };
+            const canonical = normalizeAlternativeQualifications(value);
+            // Every entry must be a recognised canonical level — anything
+            // else is rejected, never silently dropped (dropping would hide
+            // operator intent). Empty-after-cleaning is only valid as null
+            // (clear), not as [].
+            const usable = value.filter(
+                (entry) => typeof entry === "string" ? entry.trim() !== "" : entry !== null && entry !== undefined
+            );
+            if (canonical.length !== usable.length) return { ok: false };
+            return { ok: true, value: canonical.length > 0 ? canonical : null };
         }
         default: {
             // Free-text common fields: non-empty strings only.
@@ -175,6 +205,14 @@ const applyManualEligibility = (examDoc, { field, value, updatedBy = null, note 
     const max = examDoc.maximumAge ?? null;
     if (min !== null && max !== null && max < min) {
         throw new Error("applyManualEligibility: maximumAge must be >= minimumAge");
+    }
+    // Cross-field sanity for the education window: a known maximum must not
+    // rank below a known minimum (checked, not silently fixed).
+    const { getEducationRank } = require("../utils/educationLevels");
+    const minEduRank = getEducationRank(examDoc.minimumEducationLevel ?? null);
+    const maxEduRank = getEducationRank(examDoc.maximumEducationLevel ?? null);
+    if (minEduRank !== null && maxEduRank !== null && maxEduRank < minEduRank) {
+        throw new Error("applyManualEligibility: maximumEducationLevel must rank at or above minimumEducationLevel");
     }
     recordManualEdit(examDoc, canonicalField, updatedBy, note);
     return examDoc;

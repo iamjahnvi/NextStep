@@ -8,6 +8,13 @@ const {
 // Single source of truth for discovery enums/validators — canonical values
 // are defined once in utils/discovery.js, never re-typed here.
 
+const {
+    normalizeEducationLevel,
+    getEducationRank,
+} = require("../utils/educationLevels");
+// Canonical education levels live in utils/educationLevels.js (single source
+// of truth shared with matching logic) — never re-typed here.
+
 // Where a piece of eligibility data came from. SEED = original hand-curated
 // dataset, SCRAPER = published from a scraper staging draft, MANUAL = added
 // or corrected by a human operator. MIXED = scraper/seed record later touched
@@ -94,6 +101,15 @@ const manualEditSchema = new mongoose.Schema({
     } ,
 } , { _id : false });
 
+// Setter: store canonically ("Class 10" -> "10", 10 -> "10") so matching
+// never depends on input spelling. Unrecognized values pass through
+// unchanged so the path validator below can reject them explicitly.
+const canonicalEducationSetter = (value) => {
+    if (value === undefined || value === null) return value;
+    const canonical = normalizeEducationLevel(value);
+    return canonical === null ? value : canonical;
+};
+
 const examSchema = new mongoose.Schema({
     name  : {
         type : String , 
@@ -123,6 +139,14 @@ const examSchema = new mongoose.Schema({
         type : String ,
         default : null ,
         trim : true ,
+        set : canonicalEducationSetter ,
+        validate : {
+            validator : function(value) {
+                if (value === undefined || value === null) return true;
+                return normalizeEducationLevel(value) !== null;
+            } ,
+            message : "minimumEducationLevel must be a canonical education level or null" ,
+        } ,
     } ,
     // NOTE (Phase 1): values in the dataset mix class levels ("8", "10",
     // "12") and "Graduate". They are stored as canonical strings (see
@@ -130,6 +154,63 @@ const examSchema = new mongoose.Schema({
     // utils/eligibility.js — never with a Mongo string `$lte`.
     // Nullable since the flexible-eligibility redesign: degree-level exams
     // (e.g. GATE-shaped drafts) may carry no school-level bar.
+
+    // Official MAXIMUM education level (inclusive). null = not established —
+    // NEVER read as "no cap" (see noUpperEducationLimit) or as "nobody
+    // eligible". Matching (utils/eligibility.js) treats a missing maximum
+    // without an explicit open flag as UNKNOWN and excludes conservatively.
+    maximumEducationLevel : {
+        type : String ,
+        default : null ,
+        trim : true ,
+        set : canonicalEducationSetter ,
+        validate : {
+            validator : function(value) {
+                if (value === undefined || value === null) return true;
+                if (normalizeEducationLevel(value) === null) return false;
+                // Cross-field sanity: a known maximum must not rank below a
+                // known minimum (checked here, not silently fixed).
+                const maxRank = getEducationRank(value);
+                const minRank = getEducationRank(this && this.minimumEducationLevel);
+                return minRank === null || maxRank === null || maxRank >= minRank;
+            } ,
+            message : "maximumEducationLevel must be a canonical level ranking at or above minimumEducationLevel" ,
+        } ,
+    } ,
+
+    // Explicitly true ONLY when official rules establish no upper education
+    // restriction (e.g. open UG entrances a graduate may still sit). Distinct
+    // from unknown: null/false + null maximum = UNKNOWN (conservative).
+    noUpperEducationLimit : {
+        type : Boolean ,
+        default : null ,
+    } ,
+
+    // Alternative entry pathways as canonical levels (e.g. ["Diploma"] for
+    // lateral-entry exams). A student below the minimum whose own canonical
+    // level is listed here is eligible; pathways never override an explicit
+    // maximum. null/[] = none evidenced. Free-text nuance belongs in
+    // customEligibility (display-only), never here.
+    alternativeQualifications : {
+        type : [String] ,
+        default : null ,
+        set : function(value) {
+            if (value === undefined || value === null) return value;
+            if (!Array.isArray(value)) return value;
+            return value.map((entry) => {
+                const canonical = normalizeEducationLevel(entry);
+                return canonical === null ? entry : canonical;
+            });
+        } ,
+        validate : {
+            validator : function(value) {
+                if (value === undefined || value === null) return true;
+                if (!Array.isArray(value)) return false;
+                return value.every((entry) => normalizeEducationLevel(entry) !== null);
+            } ,
+            message : "alternativeQualifications entries must be canonical education levels" ,
+        } ,
+    } ,
 
     minimumAge : {
         type : Number ,

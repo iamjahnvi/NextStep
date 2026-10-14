@@ -14,7 +14,9 @@
 //   - normalizeEducationLevel(value) -> canonical string ("8".."12",
 //     "Graduate", "Post-Graduate", "Doctorate") or null if unrecognised.
 //   - getEducationRank(value) -> numeric rank for ordering, or null.
-//   - A user is eligible for an exam iff userRank >= examRank.
+//   - Bidirectional matching lives in utils/eligibility.js: a user is
+//     eligible iff they meet the minimum AND any explicit maximum, or an
+//     accepted alternative pathway. Unknown bounds never silently qualify.
 // =============================================================================
 
 const EDUCATION_LEVEL_RANK = {
@@ -23,13 +25,19 @@ const EDUCATION_LEVEL_RANK = {
     "10": 10,
     "11": 11,
     "12": 12,
+    // Diploma (post-school vocational/polytechnic) sits above any school
+    // class but below a bachelor's degree: a diploma holder meets Class-12
+    // bars but NOT Graduate bars, and graduates meet Diploma bars unless an
+    // explicit cap says otherwise. Approximation — post-10 vs post-12
+    // diplomas are not distinguished (documented limitation).
+    "Diploma": 13,
     "Graduate": 15,
     "Post-Graduate": 16,
     "Doctorate": 17,
 };
 
-// Graduate and above outrank any school class (8-12). Ranks 13-14 are left
-// unused as a gap so a future "Diploma" level could slot in without renumbering.
+// Graduate and above outrank any school class (8-12). Rank 14 is left unused
+// as a gap so a future level could slot in without renumbering.
 
 const ALLOWED_EDUCATION_LEVELS = Object.keys(EDUCATION_LEVEL_RANK);
 
@@ -57,6 +65,7 @@ const normalizeEducationLevel = (value) => {
     }
 
     const lower = trimmed.toLowerCase().replace(/\./g, "");
+    if (lower === "diploma" || lower === "polytechnic" || lower === "ug diploma") return "Diploma";
     if (lower === "graduate" || lower === "graduation" || lower === "ug") return "Graduate";
     if (
         lower === "post-graduate" ||

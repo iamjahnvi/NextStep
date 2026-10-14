@@ -162,11 +162,19 @@ describe("flexible eligibility — null-safe recommendation", () => {
             streams: null,
             subjects: null,
             minimumEducationLevel: "Graduate",
+            // Explicit upper semantics are required: without them the exam
+            // is UNKNOWN-upper and must not silently qualify (see the
+            // bidirectional education contract in utils/eligibility.js).
+            maximumEducationLevel: null,
+            noUpperEducationLimit: true,
             minimumAge: null,
             maximumAge: null,
             eligibility: { minimumPercentage: null },
         };
         assert.equal(isEligibleForExam(gateLike, scienceGraduate), true);
+        // Same exam with unknown upper restriction: conservative exclusion.
+        const gateUnknownUpper = { ...gateLike, noUpperEducationLimit: null };
+        assert.equal(isEligibleForExam(gateUnknownUpper, scienceGraduate), false);
     });
 });
 
@@ -204,13 +212,18 @@ describe("flexible eligibility — seed compatibility", () => {
         assert.ok(!names.includes("CLAT UG"));
     });
 
-    it("16. seed.js is untouched (still deleteMany+insertMany, no migration code)", () => {
+    it("16. seed.js is idempotent and non-destructive (upsert by name, no wipe)", () => {
         const fs = require("fs");
         const path = require("path");
         const code = fs.readFileSync(path.join(__dirname, "..", "seed.js"), "utf8");
-        assert.ok(/deleteMany/.test(code));
-        assert.ok(/insertMany/.test(code));
-        assert.ok(!/customEligibility|manualEdits|updateMany|updateOne/.test(code));
+        // Destructive patterns must be gone.
+        assert.ok(!/deleteMany/.test(code));
+        assert.ok(!/insertMany/.test(code));
+        // Safety contract markers must be present.
+        assert.ok(/findOne\(\{\s*name/.test(code));
+        assert.ok(/updateOne/.test(code));
+        assert.ok(/createIndex\(\{\s*name:\s*1\s*\}.*unique/.test(code));
+        assert.ok(/MANUAL/.test(code) && /MIXED/.test(code));
     });
 });
 
