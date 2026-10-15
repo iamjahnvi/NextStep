@@ -95,12 +95,41 @@ function examTypeLabel(value) {
 // -----------------------------------------------------------------------------
 // Nullable-eligibility display (flexible-eligibility redesign).
 // Backend null means "no confirmed value" — never render a fabricated
-// requirement ("All streams", "Science", "Other"). Human-readable fallbacks:
+// requirement ("All streams", "Science", "Other"). Human-readable fallbacks.
+// Education renders bidirectionally: an explicit cap shows as a range
+// ("Class 8 – Class 12") or a single class ("Class 10"); an explicitly open
+// upper side keeps the "+" suffix. Unknown uppers fall back to the
+// minimum-only label (matching excludes those exams conservatively — the
+// label never invents a cap).
 // -----------------------------------------------------------------------------
-function educationLabel(value) {
+function educationLevelName(value) {
     if (value === undefined || value === null || value === "") return null;
-    if (value === "Graduate" || value === "Post-Graduate" || value === "Doctorate") return value;
-    return `Class ${value}+`;
+    if (
+        value === "Graduate" ||
+        value === "Post-Graduate" ||
+        value === "Doctorate" ||
+        value === "Diploma"
+    ) return value;
+    return `Class ${value}`;
+}
+
+function educationRangeLabel(exam) {
+    const min = educationLevelName(exam?.minimumEducationLevel);
+    const max = educationLevelName(exam?.maximumEducationLevel);
+    const alts = Array.isArray(exam?.alternativeQualifications)
+        ? exam.alternativeQualifications.map(educationLevelName).filter(Boolean)
+        : [];
+    let main = null;
+    if (min && max) {
+        main = min === max ? min : `${min} – ${max}`;
+    } else if (min) {
+        main = `${min}+`;
+    } else if (max) {
+        main = `Up to ${max}`;
+    }
+    if (!main) return null;
+    if (alts.length > 0) return `${main} (or ${alts.join(", ")})`;
+    return main;
 }
 
 function ageLabel(value) {
@@ -291,7 +320,7 @@ function ExamDetails() {
     const meta = statusMeta(status);
     const isSaved = Boolean(savedMap[exam._id]);
     const pct = completeness(user?.profile);
-    const classLabel = educationLabel(exam.minimumEducationLevel) || "No education requirement";
+    const classLabel = educationRangeLabel(exam) || "No education requirement";
     const streamLabel = Array.isArray(exam.streams) && exam.streams.length > 0
         ? exam.streams.join(" · ")
         : "No stream requirement";
@@ -440,10 +469,10 @@ function ExamDetails() {
                                 </p>
                             </div>
                             <div className="ed-info">
-                                <p className="ed-info__label">Minimum Education Level</p>
+                                <p className="ed-info__label">Education Level</p>
                                 <p className="ed-info__value">
-                                    {educationLabel(exam.minimumEducationLevel) ||
-                                        "No minimum education specified"}
+                                    {educationRangeLabel(exam) ||
+                                        "No education requirement specified"}
                                 </p>
                             </div>
                             <div className="ed-info">
@@ -566,9 +595,9 @@ function ExamDetails() {
                             <span className="ed-rail__val">{examTypeLabel(exam.examType)}</span>
                         </div>
                         <div className="ed-rail__row">
-                            <span className="ed-rail__label">Minimum education</span>
+                            <span className="ed-rail__label">Education required</span>
                             <span className="ed-rail__val">
-                                {educationLabel(exam.minimumEducationLevel) || "—"}
+                                {educationRangeLabel(exam) || "—"}
                             </span>
                         </div>
                         <div className="ed-rail__row">
