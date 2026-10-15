@@ -228,6 +228,7 @@ const CANONICAL_EDUCATION_LEVELS = [
   "10",
   "11",
   "12",
+  "Diploma",
   "Graduate",
   "Post-Graduate",
   "Doctorate",
@@ -264,10 +265,117 @@ function normalizeAdjudicatedEducationLevel(value) {
     return "Post-Graduate";
   }
   if (lower === "phd" || lower === "doctorate") return "Doctorate";
+  if (lower === "diploma" || lower === "polytechnic") return "Diploma";
   const exact = CANONICAL_EDUCATION_LEVELS.find(
     (level) => level.toLowerCase() === lower
   );
   return exact || null;
+}
+
+// Structured education adjudication: { min?, max?, upperOpen?, alternatives? }.
+// Each present key is normalized independently; anything unrecognized rejects
+// the WHOLE value (never a partial confirmation). Returns the merged spec or
+// null. A JSON object string (CLI --value) is accepted and parsed.
+function normalizeAdjudicatedEducation(value) {
+  let input = value;
+  if (typeof input === "string") {
+    const trimmed = input.trim();
+    if (trimmed.startsWith("{")) {
+      try {
+        input = JSON.parse(trimmed);
+      } catch {
+        return null;
+      }
+    } else {
+      // Legacy scalar: one canonical minimum level.
+      const level = normalizeAdjudicatedEducationLevel(input);
+      return level === null ? null : { min: level };
+    }
+  }
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const keys = Object.keys(input);
+  if (keys.length === 0) return null;
+  if (keys.some((k) => !["min", "max", "upperOpen", "alternatives"].includes(k))) {
+    return null;
+  }
+  const spec = {};
+  if (input.min !== undefined && input.min !== null) {
+    const level = normalizeAdjudicatedEducationLevel(input.min);
+    if (level === null) return null;
+    spec.min = level;
+  }
+  if (input.max !== undefined && input.max !== null) {
+    const level = normalizeAdjudicatedEducationLevel(input.max);
+    if (level === null) return null;
+    spec.max = level;
+  }
+  if (input.upperOpen !== undefined && input.upperOpen !== null) {
+    if (typeof input.upperOpen !== "boolean") return null;
+    spec.upperOpen = input.upperOpen;
+  }
+  if (input.alternatives !== undefined && input.alternatives !== null) {
+    if (!Array.isArray(input.alternatives) || input.alternatives.length === 0) return null;
+    const canonical = [];
+    for (const entry of input.alternatives) {
+      const level = normalizeAdjudicatedEducationLevel(entry);
+      if (level === null) return null;
+      if (!canonical.includes(level)) canonical.push(level);
+    }
+    spec.alternatives = canonical;
+  }
+  return Object.keys(spec).length > 0 ? spec : null;
+}
+
+const EDUCATION_RANK = {
+  8: 8,
+  9: 9,
+  10: 10,
+  11: 11,
+  12: 12,
+  Diploma: 13,
+  Graduate: 15,
+  "Post-Graduate": 16,
+  Doctorate: 17,
+};
+
+// Merges a normalized education spec into the current axis value, recomputing
+// KNOWN/UNKNOWN. Throws on contradictions (max below min) or floor-less
+// results (a cap alone evidences no entry floor) instead of storing them.
+function confirmEducationValue(current, spec) {
+  const merged = {
+    minLevel: spec.min !== undefined ? spec.min : (current.minLevel ?? null),
+    maxLevel: spec.max !== undefined ? spec.max : (current.maxLevel ?? null),
+    upperOpen:
+      spec.upperOpen !== undefined
+        ? spec.upperOpen
+        : (current.upperOpen === undefined ? null : current.upperOpen),
+    alternativeLevels:
+      spec.alternatives !== undefined
+        ? spec.alternatives
+        : (current.alternativeLevels === undefined ? null : current.alternativeLevels),
+    appearingAllowed:
+      current.appearingAllowed === undefined ? null : current.appearingAllowed,
+  };
+  const minRank = merged.minLevel === null ? null : EDUCATION_RANK[merged.minLevel];
+  const maxRank = merged.maxLevel === null ? null : EDUCATION_RANK[merged.maxLevel];
+  if (minRank != null && maxRank != null && maxRank < minRank) {
+    throw new Error(
+      "reviewPipeline: education max must rank at or above min (contradictory confirmation rejected)"
+    );
+  }
+  const hasFloor =
+    merged.minLevel !== null ||
+    (Array.isArray(merged.alternativeLevels) && merged.alternativeLevels.length > 0);
+  if (!hasFloor) {
+    throw new Error(
+      "reviewPipeline: education confirmation needs a minimum level or alternative pathways (a cap alone is not entry evidence)"
+    );
+  }
+  return {
+    ...merged,
+    status: "KNOWN",
+    evidence: current.evidence || null,
+  };
 }
 
 // Percentage: a finite number in [0, 100]. Numeric strings (optionally with
@@ -341,21 +449,29 @@ const ADJUDICATION_CONTRACTS = {
   education: {
     hint:
       "a canonical education level " +
-      `(${CANONICAL_EDUCATION_LEVELS.join(", ")})`,
-    normalize: (value) => normalizeAdjudicatedEducationLevel(value),
-    confirm: (current, canonical) => ({
-      minLevel: canonical,
-      maxLevel: null,
-      appearingAllowed:
-        current.appearingAllowed === undefined
-          ? null
-          : current.appearingAllowed,
-      status: "KNOWN",
-      evidence: current.evidence || null,
-    }),
+      `(${CANONICAL_EDUCATION_LEVELS.join(", ")}) or a JSON object ` +
+      `{"min","max","upperOpen","alternatives"} with canonical values`,
+    normalize: (value) => {
+      // Legacy scalar ("Graduate") and structured objects share one entry
+      // point; the CLI passes strings through untouched (see operator test).
+      const spec = normalizeAdjudicatedEducation(value);
+      if (spec === null) return null;
+      // Preserve the legacy scalar round-trip for audit records.
+      if (typeof value === "string" && !value.trim().startsWith("{") && spec.min && Object.keys(spec).length === 1) {
+        return spec.min;
+      }
+      return spec;
+    },
+    confirm: (current, canonical) => {
+      const spec =
+        typeof canonical === "string" ? { min: canonical } : canonical;
+      return confirmEducationValue(current, spec);
+    },
     keep: (current) => ({
       minLevel: null,
       maxLevel: null,
+      upperOpen: null,
+      alternativeLevels: null,
       appearingAllowed:
         current.appearingAllowed === undefined
           ? null
@@ -436,6 +552,14 @@ const ADJUDICABLE_AXES = Object.keys(ADJUDICATION_CONTRACTS);
 //                     extraction evidence preserved byte-identical.
 //     KEEP_UNKNOWN  : value must be absent; the axis stays null/UNKNOWN and
 //                     only the audit record is added.
+//   Education COMPLETION (the one exception): a KNOWN education axis accepts
+//     CONFIRM_VALUE with a STRUCTURED value (object or JSON string) that
+//     preserves the confirmed minimum (spec.min absent, or equal to the
+//     current minLevel) to complete upperOpen/maxLevel/alternativeLevels —
+//     the upper semantics extraction cannot evidence. Floors are never
+//     re-decided through this path (scalar values on KNOWN axes still throw);
+//     contradictions still throw. This is what unblocks publishing for
+//     KNOWN-min drafts whose upper side extraction left unknown.
 //   Rules: DRAFT only (VERIFIED/REJECTED are immutable); decidedBy required;
 //   status never transitions here (no auto-promotion); unrelated fields are
 //   never touched; the mutated draft re-validates before anything is saved.
@@ -469,10 +593,26 @@ async function adjudicateDraft(EditionDraft, id, options = {}) {
   const plain = toPlain(draft);
   const current = plain.edition && plain.edition.eligibility &&
     plain.edition.eligibility[axis];
-  if (!current || current.status !== "UNKNOWN") {
-    throw new Error(
-      `reviewPipeline: axis "${axis}" is not UNKNOWN (status is ${current ? current.status : "missing"})`
-    );
+  // Education completion (see header): a KNOWN education axis may receive a
+  // structured CONFIRM_VALUE that preserves its minimum to complete the
+  // upper side. Everything else still requires UNKNOWN.
+  const looksStructured =
+    value !== undefined &&
+    value !== null &&
+    (typeof value === "object" ||
+      (typeof value === "string" && value.trim().startsWith("{")));
+  const educationCompletion =
+    axis === "education" &&
+    decision === "CONFIRM_VALUE" &&
+    looksStructured &&
+    current &&
+    current.status === "KNOWN";
+  if (!educationCompletion) {
+    if (!current || current.status !== "UNKNOWN") {
+      throw new Error(
+        `reviewPipeline: axis "${axis}" is not UNKNOWN (status is ${current ? current.status : "missing"})`
+      );
+    }
   }
 
   let confirmedValue = null;
@@ -482,6 +622,27 @@ async function adjudicateDraft(EditionDraft, id, options = {}) {
       throw new Error(
         `reviewPipeline: CONFIRM_VALUE requires ${contract.hint}`
       );
+    }
+    if (educationCompletion) {
+      // Completion preserves the confirmed floor: a structured value may
+      // only fill gaps (absent min) or restate the same minimum — never
+      // re-decide it, and never as a bare scalar.
+      if (typeof confirmedValue === "string") {
+        throw new Error(
+          "reviewPipeline: completing a KNOWN education axis needs a structured value " +
+            '(e.g. {"upperOpen":true}); scalars cannot re-decide a confirmed minimum'
+        );
+      }
+      if (
+        confirmedValue.min !== undefined &&
+        current.minLevel != null &&
+        confirmedValue.min !== current.minLevel
+      ) {
+        throw new Error(
+          `reviewPipeline: completion preserves the confirmed minimum (${current.minLevel}); ` +
+            "to correct a floor, reject and re-extract instead"
+        );
+      }
     }
   } else if (value !== undefined && value !== null) {
     throw new Error("reviewPipeline: KEEP_UNKNOWN takes no value");
@@ -546,6 +707,8 @@ module.exports = {
   rejectDraft,
   adjudicateDraft,
   normalizeAdjudicatedEducationLevel,
+  normalizeAdjudicatedEducation,
+  confirmEducationValue,
   normalizeAdjudicatedPercentage,
   normalizeAdjudicatedAge,
   normalizeAdjudicatedStringList,

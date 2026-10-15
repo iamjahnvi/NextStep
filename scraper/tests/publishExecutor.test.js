@@ -97,6 +97,10 @@ function fullEdition(overrides = {}) {
       education: {
         minLevel: "12",
         maxLevel: null,
+        // Completed upper semantics (operator-confirmed): required by the
+        // publish gate — extraction-shaped drafts stay staged for review.
+        upperOpen: true,
+        alternativeLevels: null,
         appearingAllowed: null,
         status: "KNOWN",
         evidence: validEvidence(),

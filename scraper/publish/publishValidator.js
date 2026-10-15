@@ -37,10 +37,23 @@ const PUBLISH_EDUCATION_LEVELS = [
   "10",
   "11",
   "12",
+  "Diploma",
   "Graduate",
   "Post-Graduate",
   "Doctorate",
 ];
+
+const PUBLISH_EDUCATION_RANK = {
+  8: 8,
+  9: 9,
+  10: 10,
+  11: 11,
+  12: 12,
+  Diploma: 13,
+  Graduate: 15,
+  "Post-Graduate": 16,
+  Doctorate: 17,
+};
 
 // NOTE: required dates deliberately avoid z.coerce.date() — coercion turns
 // null into the Unix epoch (new Date(null)), which would let missing dates
@@ -83,6 +96,13 @@ const PublishExamSchema = z
     minimumAge: z.number().int().min(0).nullable().optional(),
     maximumAge: z.number().int().min(0).nullable().optional(),
     minimumEducationLevel: z.enum(PUBLISH_EDUCATION_LEVELS),
+    // Upper education semantics must be EXPLICIT: a known cap, or an explicit
+    // "no cap" flag. A missing maximum without noUpperEducationLimit:true is
+    // UNKNOWN (not "everyone eligible") and unpublishable — the draft stays
+    // staged for operator review instead of shipping guesses.
+    maximumEducationLevel: z.enum(PUBLISH_EDUCATION_LEVELS).nullable().optional(),
+    noUpperEducationLimit: z.boolean().nullable().optional(),
+    alternativeQualifications: z.array(z.enum(PUBLISH_EDUCATION_LEVELS)).nullable().optional(),
     // Nullable by product decision: null = "no confirmed requirement"
     // (e.g. degree-level exams with no school-stream/subject gating).
     // A PRESENT array must still be non-empty with non-empty entries —
@@ -127,6 +147,22 @@ const PublishExamSchema = z
       exam.minimumAge == null ||
       exam.maximumAge >= exam.minimumAge,
     { message: "maximumAge must be >= minimumAge when both are present" }
+  )
+  .refine(
+    (exam) =>
+      exam.maximumEducationLevel != null || exam.noUpperEducationLimit === true,
+    {
+      message:
+        "upper education restriction must be explicit: maximumEducationLevel or noUpperEducationLimit:true",
+    }
+  )
+  .refine(
+    (exam) =>
+      exam.maximumEducationLevel == null ||
+      exam.minimumEducationLevel == null ||
+      PUBLISH_EDUCATION_RANK[exam.maximumEducationLevel] >=
+        PUBLISH_EDUCATION_RANK[exam.minimumEducationLevel],
+    { message: "maximumEducationLevel must rank at or above minimumEducationLevel" }
   );
 
 function validatePublishRequest({ draft, payload } = {}) {

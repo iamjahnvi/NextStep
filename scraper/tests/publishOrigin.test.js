@@ -60,7 +60,7 @@ function fullEdition(overrides = {}) {
       endDate: new Date("2026-02-20T00:00:00Z"),
     },
     eligibility: {
-      education: { minLevel: "12", maxLevel: null, appearingAllowed: null, status: "KNOWN", evidence: validEvidence() },
+      education: { minLevel: "12", maxLevel: null, upperOpen: true, alternativeLevels: null, appearingAllowed: null, status: "KNOWN", evidence: validEvidence() },
       stream: { allowed: ["Science"], status: "KNOWN", evidence: validEvidence() },
       subjects: { requiredAny: ["Physics"], status: "KNOWN", evidence: validEvidence() },
       percentage: { min: null, status: "UNKNOWN", evidence: null },

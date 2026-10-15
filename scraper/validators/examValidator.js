@@ -29,6 +29,35 @@ const EligibilityStatusSchema = z.enum([
   "NEEDS_VERIFICATION",
 ]);
 
+// Canonical education levels, aligned with server/utils/educationLevels.js
+// (local copy — the scraper never imports server code). Stored levels must be
+// canonical; UNKNOWN is null, never a guessed string.
+const EducationLevelSchema = z.enum([
+  "8",
+  "9",
+  "10",
+  "11",
+  "12",
+  "Diploma",
+  "Graduate",
+  "Post-Graduate",
+  "Doctorate",
+]);
+
+// Canonical rank order for contradiction checks (mirrors the server ranks:
+// Diploma sits above any school class, below a bachelor's degree).
+const EDUCATION_RANK = {
+  8: 8,
+  9: 9,
+  10: 10,
+  11: 11,
+  12: 12,
+  Diploma: 13,
+  Graduate: 15,
+  "Post-Graduate": 16,
+  Doctorate: 17,
+};
+
 const ConfidenceSchema = z.enum(["HIGH", "MEDIUM", "LOW"]);
 
 const DocTypeSchema = z.enum(["HTML", "PDF", "OTHER"]);
@@ -64,8 +93,15 @@ const EligibilitySchema = z
   .object({
     education: z
       .object({
-        minLevel: z.string().nullable(),
-        maxLevel: z.string().nullable(),
+        minLevel: EducationLevelSchema.nullable(),
+        maxLevel: EducationLevelSchema.nullable(),
+        // Explicitly true only when the source states no upper education
+        // restriction. null = not established (distinct from unrestricted).
+        // Optional (not merely nullable) so drafts written before this axis
+        // existed still validate; the PUBLISH gate requires it explicit.
+        upperOpen: z.boolean().nullable().optional(),
+        // Alternative entry pathways as canonical levels (e.g. Diploma).
+        alternativeLevels: z.array(EducationLevelSchema).nullable().optional(),
         appearingAllowed: z.boolean().nullable(),
         ...statusAndEvidence,
       })
@@ -73,10 +109,20 @@ const EligibilitySchema = z
       .refine(
         (v) =>
           v.status !== "KNOWN" ||
-          (v.minLevel !== null &&
+          ((v.minLevel !== null &&
             v.minLevel !== undefined &&
-            v.minLevel !== ""),
-        { message: "education: KNOWN requires a minLevel value" }
+            v.minLevel !== "") ||
+            (Array.isArray(v.alternativeLevels) && v.alternativeLevels.length > 0)),
+        { message: "education: KNOWN requires a minLevel value or alternative pathways" }
+      )
+      .refine(
+        (v) =>
+          v.minLevel == null ||
+          v.maxLevel == null ||
+          EDUCATION_RANK[v.maxLevel] === undefined ||
+          EDUCATION_RANK[v.minLevel] === undefined ||
+          EDUCATION_RANK[v.maxLevel] >= EDUCATION_RANK[v.minLevel],
+        { message: "education: maxLevel must rank at or above minLevel" }
       ),
     stream: z
       .object({
@@ -128,7 +174,7 @@ function buildUnknownEligibility() {
     evidence: null,
   });
   return {
-    education: unknown({ minLevel: null, maxLevel: null, appearingAllowed: null }),
+    education: unknown({ minLevel: null, maxLevel: null, upperOpen: null, alternativeLevels: null, appearingAllowed: null }),
     stream: unknown({ allowed: null }),
     subjects: unknown({ requiredAny: null }),
     percentage: unknown({ min: null }),
@@ -193,6 +239,8 @@ function validateEvidence(doc) {
 
 module.exports = {
   EligibilityStatusSchema,
+  EducationLevelSchema,
+  EDUCATION_RANK,
   ConfidenceSchema,
   DocTypeSchema,
   EvidenceSchema,

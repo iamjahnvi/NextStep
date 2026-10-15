@@ -70,6 +70,11 @@ function fullEdition(cycle = "2026") {
       education: {
         minLevel: "12",
         maxLevel: null,
+        // Completed upper semantics (operator-confirmed): the publish gate
+        // requires an explicit upper side — extraction-shaped drafts stay
+        // staged for review instead of publishing.
+        upperOpen: true,
+        alternativeLevels: null,
         appearingAllowed: null,
         status: "KNOWN",
         evidence: validEvidence(),

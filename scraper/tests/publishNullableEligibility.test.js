@@ -19,7 +19,7 @@ const { mapDraftToExamPayload } = require("../publish/examMapper");
 const { validatePublishRequest } = require("../publish/publishValidator");
 const { buildPublishPayloadFromDraft } = require("../publish/publishService");
 const { getExamEditionDraftModel } = require("../models/examEditionDraft");
-const { saveDraft, promoteDraft } = require("../pipeline/reviewPipeline");
+const { saveDraft, promoteDraft, adjudicateDraft } = require("../pipeline/reviewPipeline");
 const { startIsolatedDb, closeIsolatedDb } = require("./helpers/isolatedDb");
 
 function validExam(overrides = {}) {
@@ -51,7 +51,10 @@ function validEvidence(overrides = {}) {
 }
 
 // GATE-shaped edition: Graduate education (adjudicable), everything else
-// UNKNOWN — the exact shape the real GATE audit produced.
+// UNKNOWN — the exact shape the real GATE audit produced. The upper side is
+// deliberately NOT completed here: extraction cannot evidence it, so the
+// draft stays staged until an operator completes it (see verifiedGateDraftId;
+// the uncompleted shape must NOT publish — staged for review instead).
 function gateShapedEdition(overrides = {}) {
   return {
     examSlug: "nullable-test-exam",
@@ -62,7 +65,7 @@ function gateShapedEdition(overrides = {}) {
       endDate: new Date("2026-02-20T00:00:00Z"),
     },
     eligibility: {
-      education: { minLevel: "Graduate", maxLevel: null, appearingAllowed: null, status: "KNOWN", evidence: validEvidence() },
+      education: { minLevel: "Graduate", maxLevel: null, upperOpen: null, alternativeLevels: null, appearingAllowed: null, status: "KNOWN", evidence: validEvidence() },
       stream: { allowed: null, status: "UNKNOWN", evidence: null },
       subjects: { requiredAny: null, status: "UNKNOWN", evidence: null },
       percentage: { min: null, status: "UNKNOWN", evidence: null },
@@ -98,15 +101,44 @@ describe("publish boundary — nullable eligibility (no invented values)", () =>
 
   async function verifiedGateDraftId() {
     const saved = await saveDraft(EditionDraft, { exam: validExam(), edition: gateShapedEdition() });
+    // Real workflow: extraction evidences the floor; the operator completes
+    // the upper side (no official cap for GATE) before promotion/publish.
+    await adjudicateDraft(EditionDraft, saved._id, {
+      axis: "education",
+      decision: "CONFIRM_VALUE",
+      value: { upperOpen: true },
+      decidedBy: "operator-upper",
+      note: "No official upper qualification cap evidenced",
+    });
     const verified = await promoteDraft(EditionDraft, saved._id);
     assert.equal(verified.status, "VERIFIED");
+    assert.equal(verified.edition.eligibility.education.upperOpen, true);
     return verified._id;
   }
+
+  it("12a. extraction-shaped KNOWN-min/unknown-upper drafts do NOT publish (staged for review)", async () => {
+    const saved = await saveDraft(EditionDraft, { exam: validExam(), edition: gateShapedEdition() });
+    const verified = await promoteDraft(EditionDraft, saved._id);
+    const { exam } = mapDraftToExamPayload(verified);
+    assert.equal(exam.minimumEducationLevel, "Graduate");
+    assert.equal(exam.maximumEducationLevel, null);
+    assert.equal(exam.noUpperEducationLimit, null);
+    const result = validatePublishRequest({ draft: verified, payload: exam });
+    assert.equal(result.ok, false);
+    assert.ok(
+      JSON.stringify(result.issues).includes("upper education restriction must be explicit")
+    );
+    // The service layer refuses too — no auto-publish from extraction alone.
+    assert.throws(() => buildPublishPayloadFromDraft(verified));
+  });
 
   it("12. GATE-shaped VERIFIED draft publishes without streams/subjects", async () => {
     const id = await verifiedGateDraftId();
     const { exam, provenance } = buildPublishPayloadFromDraft(await EditionDraft.findById(id));
     assert.equal(exam.minimumEducationLevel, "Graduate");
+    // Operator-completed upper side flows through explicitly.
+    assert.equal(exam.maximumEducationLevel, null);
+    assert.equal(exam.noUpperEducationLimit, true);
     assert.equal(exam.streams, null);
     assert.equal(exam.subjects, null);
     assert.equal(exam.minimumAge, null);
@@ -135,8 +167,20 @@ describe("publish boundary — nullable eligibility (no invented values)", () =>
   });
 
   it("12. validator accepts null streams/subjects but rejects [] and ['']", () => {
-    const base = mapDraftToExamPayload({ exam: validExam(), edition: gateShapedEdition() }).exam;
-    const draft = { status: "VERIFIED", edition: gateShapedEdition() };
+    // Completed shape (operator-confirmed upper): the extraction-shaped draft
+    // without explicit upper semantics is rejected by design (see test 12a).
+    const completed = {
+      ...gateShapedEdition(),
+      eligibility: {
+        ...gateShapedEdition().eligibility,
+        education: {
+          ...gateShapedEdition().eligibility.education,
+          upperOpen: true,
+        },
+      },
+    };
+    const base = mapDraftToExamPayload({ exam: validExam(), edition: completed }).exam;
+    const draft = { status: "VERIFIED", edition: completed };
     assert.equal(validatePublishRequest({ draft, payload: base }).ok, true);
     assert.equal(
       validatePublishRequest({ draft, payload: { ...base, streams: [] } }).ok,

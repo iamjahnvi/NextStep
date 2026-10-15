@@ -65,6 +65,10 @@ function knownEligibility() {
     education: {
       minLevel: "12",
       maxLevel: null,
+      // Completed upper semantics (operator-confirmed): the publish gate
+      // requires an explicit upper side — see the staged-draft rejection test.
+      upperOpen: true,
+      alternativeLevels: null,
       appearingAllowed: null,
       status: "KNOWN",
       evidence: validEvidence(),

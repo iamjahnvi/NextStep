@@ -28,14 +28,20 @@
 //     ("admission to NIT+ System", counselling, seat allotment) are skipped:
 //     downstream admission criteria are not generic exam eligibility. A bare
 //     "seeking admission this year" (no institution) still extracts.
-//   - education minLevel: "8" | "10" | "12" | "Graduate" | "Post-Graduate" |
-//     "Doctorate". Multi-category rule (generic): every distinct signaled
-//     level is collected. ONE distinct level -> KNOWN (the single-category
-//     case). SEVERAL distinct levels -> the schema holds a single minLevel
-//     and cannot represent alternatives, so minLevel stays null/UNKNOWN and
-//     the per-category excerpts are preserved in one LOW-confidence evidence
-//     entry — the ambiguity stays visible instead of collapsing to a guessed
-//     "most demanding" bar, and UNKNOWN is never "not eligible".
+//   - education minLevel: "8" | "9" | "10" | "11" | "12" | "Diploma" |
+//     "Graduate" | "Post-Graduate" | "Doctorate". Explicit school-class RANGE
+//     constructions ("Class 8 to 10") extract as a KNOWN bounded
+//     { minLevel, maxLevel } pair. Explicit "no upper qualification cap"
+//     phrasing sets upperOpen:true; explicit diploma-entry phrasing sets
+//     alternativeLevels:["Diploma"]. Multi-category rule (generic): every
+//     distinct signaled level is collected. ONE distinct level -> KNOWN (the
+//     single-category case). SEVERAL distinct levels -> the schema holds a
+//     single minLevel and cannot represent alternatives, so minLevel stays
+//     null/UNKNOWN and the per-category excerpts are preserved in one
+//     LOW-confidence evidence entry — the ambiguity stays visible instead of
+//     collapsing to a guessed "most demanding" bar, and UNKNOWN is never
+//     "not eligible". Contradictory ranges ("Class 12 to 8") and DOB-style
+//     partial signals go NEEDS_VERIFICATION, never KNOWN.
 //   - percentage min: number 0–100. percentage: KNOWN requires a value.
 //   - age min/max: ints. DOB cutoffs ("born on or after …") with no ints →
 //     NEEDS_VERIFICATION with null values.
@@ -69,13 +75,17 @@ const EXTRACTOR_TAG = "eligibility.v1";
 
 const EDUCATION_RANK = {
   8: 8,
+  9: 9,
   10: 10,
   11: 11,
   12: 12,
+  Diploma: 13,
   Graduate: 15,
   "Post-Graduate": 16,
   Doctorate: 17,
 };
+// Local copy of the canonical rank order (server/utils/educationLevels.js).
+// Diploma (13) sits above any school class and below a bachelor's degree.
 
 // Signal order is irrelevant: distinct levels are collected and decided on
 // as a set (see the multi-category rule in the header).
@@ -86,7 +96,40 @@ const EDUCATION_SIGNALS = [
   { level: "12", re: /(\b10\s*\+\s*2\b|\b12\s?th\b|\bclass\s*12\b|\bclass\s*XII\b|higher\s+secondary|senior\s+secondary|intermediate\s+(?:education|exam)|hsc\b)/i },
   { level: "11", re: /(\b11\s?th\b|\bclass\s*XI\b)/i },
   { level: "10", re: /(\b10\s?th\b|\bclass\s*10\b|\bclass\s*X\b|matriculation|secondary\s+school(?!.*higher)|ssc\s+(?:exam|board))/i },
+  { level: "9", re: /(\b9\s?th\b|\bclass\s*9\b|\bclass\s*IX\b)/i },
   { level: "8", re: /(\b8\s?th\b|\bclass\s*8\b|elementary\s+education)/i },
+];
+
+// Explicit school-class RANGE constructions ("Class 8 to 10", "classes 8-12").
+// Both ends must be rankable school classes; anything else (degree ranges,
+// reversed ranges) is left for human review, never guessed.
+const EDUCATION_RANGE_RES = [
+  /(?:from\s+)?class\s*(\d{1,2})\s*(?:to|-|–|through)\s*(?:class\s*)?(\d{1,2})/i,
+  /classes\s*(\d{1,2})\s*(?:to|-|–)\s*(\d{1,2})/i,
+];
+
+// Explicit "no upper cap" phrasing for the EDUCATION axis only (age caps use
+// different wording and must never satisfy this — an age limit is not a
+// qualification limit).
+const UPPER_OPEN_RES = [
+  /no\s+(?:upper|maximum)\s+(?:limit\s+(?:on\s+|for\s+)?)?(?:educational\s+qualifications?|education(?:al)?\s+qualifications?|qualifications?)/i,
+  /irrespective\s+of\s+higher\s+qualifications?/i,
+  /higher\s+qualifications?\s+(?:may\s+also|are\s+also|can\s+also)\s+(?:apply|be\s+eligible)/i,
+];
+
+// Explicit alternative entry pathways. Deliberately narrow: only diploma
+// phrasing is machine-recognized. Degree-level "or" alternatives ("Bachelor's
+// or Master's may apply") stay UNKNOWN for human review — collapsing them
+// would invent a minimum.
+const ALTERNATIVE_RES = [
+  {
+    level: "Diploma",
+    re: /diploma\s+holders?\s+(?:may\s+also|are\s+also|can\s+also|are)\s+(?:also\s+)?(?:eligible|apply|admitted)/i,
+  },
+  {
+    level: "Diploma",
+    re: /(?:10\s*\+\s*2|class\s*12)\s+or\s+equivalent\s+diploma/i,
+  },
 ];
 
 const APPEARING_RE = /\b(appearing|appeared)\b.{0,60}\b(candidates?|students?|applicants?)\b.{0,60}\b(eligible|apply|appear)\b|\bfinal\s+year\b.{0,40}\beligible\b/i;
@@ -95,7 +138,7 @@ const APPEARING_RE = /\b(appearing|appeared)\b.{0,60}\b(candidates?|students?|ap
 // an actual eligibility rule (as opposed to a paper title, glossary entry,
 // or link label that merely names a degree).
 const REQUIREMENT_CONTEXT_RE =
-  /\bmust\b|\bhave\b|\bhas\b|\bhaving\b|\bholds?\b|\bholding\b|\bpassed\b|\bpassing\b|\bpass\b|\bcompleted?\b|\bobtained?\b|\brequire\b|\brequires\b|\brequired\b|\brequirement\b|\beligib\w*|\bqualif\w*|\badmission\b|\badmit\b|\bappl(y|ied|icants?)\b|\bminimum\b|\bat least\b|\bshould\b|\bshall\b|\bcriteria\b|\bstudying\b|\benrolled\b|\bappear\b/i;
+  /\bmust\b|\bhave\b|\bhas\b|\bhaving\b|\bholds?\b|\bholding\b|\bpassed\b|\bpassing\b|\bpass\b|\bcompleted?\b|\bobtained?\b|\brequire\b|\brequires\b|\brequired\b|\brequirement\b|\beligib\w*|\bqualif\w*|\badmission\b|\badmit\b|\bappl(y|ied|icants?)\b|\bminimum\b|\bat least\b|\bshould\b|\bshall\b|\bcriteria\b|\bstudying\b|\benrolled\b|\bappear\b|\bopen\s+to\b/i;
 
 const REQUIREMENT_CONTEXT_CHARS = 200;
 const REQUIREMENT_FOLLOW_CHARS = 120;
@@ -276,13 +319,123 @@ function extractEligibility(text, ctx = {}, vocab = {}) {
   const appearingMatch = APPEARING_RE.exec(collapsed);
   if (appearingMatch) appearingAllowed = true;
 
-  if (matchedLevels.length === 1) {
+  // --- education range (bounded) -------------------------------------------
+  // An explicit "Class X to Y" construction inside requirement context is a
+  // KNOWN bounded range — not two competing categories. Ends must be
+  // rankable school classes with lo <= hi; anything else (degree ranges,
+  // reversed ranges) is contradictory input for human review.
+  let rangedEducation = null;
+  for (const re of EDUCATION_RANGE_RES) {
+    const global = new RegExp(
+      re.source,
+      re.flags.includes("g") ? re.flags : `${re.flags}g`
+    );
+    let match = null;
+    while ((match = global.exec(collapsed)) !== null) {
+      if (match[0].length === 0) {
+        global.lastIndex += 1;
+        continue;
+      }
+      const nearby =
+        contextAround(collapsed, match.index, REQUIREMENT_CONTEXT_CHARS) +
+        " " +
+        collapsed.slice(match.index + match[0].length, match.index + match[0].length + REQUIREMENT_FOLLOW_CHARS);
+      if (!REQUIREMENT_CONTEXT_RE.test(nearby)) continue;
+      const lo = match[1];
+      const hi = match[2];
+      if (EDUCATION_RANK[lo] === undefined || EDUCATION_RANK[hi] === undefined) continue;
+      rangedEducation = {
+        lo,
+        hi,
+        contradictory: EDUCATION_RANK[hi] < EDUCATION_RANK[lo],
+        excerpt: windowAround(collapsed, match.index),
+      };
+      break;
+    }
+    if (rangedEducation) break;
+  }
+
+  // --- education upper-open + alternatives -----------------------------------
+  // Narrow, explicitly-worded signals only (see pattern docs above). Each
+  // must sit near requirement context — a bare "diploma" in a course list or
+  // an age-limit "no upper limit" states no education rule.
+  const nearRequirement = (index, length) => {
+    const nearby =
+      contextAround(collapsed, index, REQUIREMENT_CONTEXT_CHARS) +
+      " " +
+      collapsed.slice(index + length, index + length + REQUIREMENT_FOLLOW_CHARS);
+    return REQUIREMENT_CONTEXT_RE.test(nearby);
+  };
+  let upperOpen = null;
+  let upperOpenExcerpt = null;
+  for (const re of UPPER_OPEN_RES) {
+    const match = re.exec(collapsed);
+    if (match && nearRequirement(match.index, match[0].length)) {
+      upperOpen = true;
+      upperOpenExcerpt = windowAround(collapsed, match.index);
+      break;
+    }
+  }
+  const alternativeLevels = [];
+  const alternativeExcerpts = [];
+  for (const { level, re } of ALTERNATIVE_RES) {
+    const global = new RegExp(
+      re.source,
+      re.flags.includes("g") ? re.flags : `${re.flags}g`
+    );
+    let match = null;
+    while ((match = global.exec(collapsed)) !== null) {
+      if (match[0].length === 0) {
+        global.lastIndex += 1;
+        continue;
+      }
+      if (!nearRequirement(match.index, match[0].length)) continue;
+      if (!alternativeLevels.includes(level)) {
+        alternativeLevels.push(level);
+        alternativeExcerpts.push(windowAround(collapsed, match.index));
+      }
+    }
+  }
+
+  if (rangedEducation) {
+    if (rangedEducation.contradictory) {
+      // "Class 12 to 8" style text states no coherent range — flag for
+      // verification instead of publishing either end as fact.
+      eligibility.education = {
+        minLevel: null,
+        maxLevel: null,
+        upperOpen: null,
+        alternativeLevels: null,
+        appearingAllowed,
+        status: "NEEDS_VERIFICATION",
+        evidence: buildEvidence(base, {
+          confidence: "LOW",
+          excerpt: rangedEducation.excerpt,
+        }),
+      };
+    } else {
+      eligibility.education = {
+        minLevel: rangedEducation.lo,
+        maxLevel: rangedEducation.hi,
+        upperOpen: null,
+        alternativeLevels: alternativeLevels.length > 0 ? [...alternativeLevels] : null,
+        appearingAllowed,
+        status: "KNOWN",
+        evidence: buildEvidence(base, {
+          confidence: "MEDIUM",
+          excerpt: rangedEducation.excerpt,
+        }),
+      };
+    }
+  } else if (matchedLevels.length === 1) {
     const only = matchedLevels[0];
     const home = sectionAt(only.index, sections);
     const inEligibility = home !== null && home.axis === "ELIGIBILITY";
     eligibility.education = {
       minLevel: only.level,
       maxLevel: null,
+      upperOpen,
+      alternativeLevels: alternativeLevels.length > 0 ? [...alternativeLevels] : null,
       appearingAllowed,
       status: "KNOWN",
       evidence: buildEvidence(base, {
@@ -294,20 +447,55 @@ function extractEligibility(text, ctx = {}, vocab = {}) {
       }),
     };
   } else if (matchedLevels.length > 1) {
-    const combined = matchedLevels
-      .sort((a, b) => EDUCATION_RANK[a.level] - EDUCATION_RANK[b.level])
-      .map((m) => `[${m.level}] ${m.excerpt}`)
-      .join(" | ");
-    eligibility.education = {
-      minLevel: null,
-      maxLevel: null,
-      appearingAllowed,
-      status: "UNKNOWN",
-      evidence: buildEvidence(base, {
-        confidence: "LOW",
-        excerpt: combined,
-      }),
-    };
+    // Consecutive-list rule (IOQM-style "Class 8, 9, 10, 11 or 12 are
+    // eligible"): distinct levels forming an unbroken rank run inside ONE
+    // sentence/clause state a bounded range, not competing categories.
+    // Levels split across sentences ("Class X ... course. Class XII ...
+    // post.") stay UNKNOWN — separate clauses mean separate rules.
+    const byRank = [...matchedLevels].sort(
+      (a, b) => EDUCATION_RANK[a.level] - EDUCATION_RANK[b.level]
+    );
+    const ranks = byRank.map((m) => EDUCATION_RANK[m.level]);
+    const consecutive =
+      ranks.length > 1 && ranks.every((r, i) => i === 0 || r === ranks[i - 1] + 1);
+    const spanStart = Math.min(...matchedLevels.map((m) => m.index));
+    const spanEnd = Math.max(...matchedLevels.map((m) => m.index + m.length));
+    const spanText = collapsed.slice(spanStart, spanEnd);
+    const singleClause = !/[.!?;]/.test(spanText);
+    if (consecutive && singleClause) {
+      const home = sectionAt(byRank[0].index, sections);
+      const inEligibility = home !== null && home.axis === "ELIGIBILITY";
+      eligibility.education = {
+        minLevel: byRank[0].level,
+        maxLevel: byRank[byRank.length - 1].level,
+        upperOpen: null,
+        alternativeLevels: alternativeLevels.length > 0 ? [...alternativeLevels] : null,
+        appearingAllowed,
+        status: "KNOWN",
+        evidence: buildEvidence(base, {
+          confidence: inEligibility ? "HIGH" : "MEDIUM",
+          excerpt: windowAround(collapsed, byRank[0].index),
+          section: base.section || sectionNameAt(byRank[0].index),
+        }),
+      };
+    } else {
+      const combined = matchedLevels
+        .sort((a, b) => EDUCATION_RANK[a.level] - EDUCATION_RANK[b.level])
+        .map((m) => `[${m.level}] ${m.excerpt}`)
+        .join(" | ");
+      eligibility.education = {
+        minLevel: null,
+        maxLevel: null,
+        upperOpen: null,
+        alternativeLevels: null,
+        appearingAllowed,
+        status: "UNKNOWN",
+        evidence: buildEvidence(base, {
+          confidence: "LOW",
+          excerpt: combined,
+        }),
+      };
+    }
   } else if (appearingAllowed !== null) {
     // "Appearing candidates may apply" with no stated bar: real but partial
     // signal — flag for verification instead of inventing a minLevel.

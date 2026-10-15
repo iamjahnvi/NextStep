@@ -212,8 +212,23 @@ describe("Phase 16 — full lifecycle on GATE 2026 (isolated, no live fetch)", (
     assert.equal(adjudicated.adjudications[0].decidedBy, "lifecycle-operator");
     assert.equal(adjudicated.status, "DRAFT");
 
+    // 6b. Complete the upper side on the KNOWN axis (structured completion
+    // preserving the floor): extraction cannot evidence a cap or its
+    // absence, and the publish gate requires it explicit.
+    const completed = await adjudicateDraft(EditionDraft, staged._id, {
+      axis: "education",
+      decision: "CONFIRM_VALUE",
+      value: { upperOpen: true },
+      decidedBy: "lifecycle-operator",
+      note: "No official upper qualification cap evidenced",
+    });
+    assert.equal(completed.edition.eligibility.education.status, "KNOWN");
+    assert.equal(completed.edition.eligibility.education.minLevel, "Graduate");
+    assert.equal(completed.edition.eligibility.education.upperOpen, true);
+    assert.equal(completed.adjudications.length, 2);
+
     // 7–8. Review validation, then promote.
-    assert.equal(reviewDraft(adjudicated).valid, true);
+    assert.equal(reviewDraft(completed).valid, true);
     const verified = await promoteDraft(EditionDraft, staged._id);
     assert.equal(verified.status, "VERIFIED");
 
@@ -236,6 +251,7 @@ describe("Phase 16 — full lifecycle on GATE 2026 (isolated, no live fetch)", (
     const published = await Exam.find({ name: "GATE 2026" }).lean();
     assert.equal(published.length, 1);
     assert.equal(published[0].minimumEducationLevel, "Graduate");
+    assert.equal(published[0].noUpperEducationLimit, true);
     const receipts = await Receipt.find({}).lean();
     assert.equal(receipts.length, 1);
     assert.equal(receipts[0].identity, "gate-2026:2026:2026");

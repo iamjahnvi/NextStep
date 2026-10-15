@@ -15,6 +15,9 @@
 //   eligibility.age.min        → minimumAge (KNOWN only, else null)
 //   eligibility.age.max        → maximumAge (KNOWN only, else null)
 //   eligibility.education      → minimumEducationLevel (KNOWN minLevel, else null)
+//   eligibility.education      → maximumEducationLevel (KNOWN maxLevel, else null)
+//   eligibility.education      → noUpperEducationLimit (KNOWN upperOpen, else null)
+//   eligibility.education      → alternativeQualifications (KNOWN alternativeLevels, else null)
 //   eligibility.stream.allowed → streams (KNOWN only, else null)
 //   eligibility.subjects       → subjects (KNOWN requiredAny, else null)
 //   eligibility.percentage.min → eligibility.minimumPercentage (KNOWN, else null)
@@ -61,6 +64,19 @@ function mapDraftToExamPayload(draft) {
     minimumEducationLevel: knownValue(
       eligibility.education,
       (axis) => axis.minLevel ?? null
+    ),
+    maximumEducationLevel: knownValue(
+      eligibility.education,
+      (axis) => axis.maxLevel ?? null
+    ),
+    noUpperEducationLimit: knownValue(
+      eligibility.education,
+      (axis) => axis.upperOpen ?? null
+    ),
+    alternativeQualifications: knownValue(eligibility.education, (axis) =>
+      Array.isArray(axis.alternativeLevels) && axis.alternativeLevels.length > 0
+        ? [...axis.alternativeLevels]
+        : null
     ),
     streams: knownValue(eligibility.stream, (axis) =>
       Array.isArray(axis.allowed) ? [...axis.allowed] : null
