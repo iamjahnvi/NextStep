@@ -124,6 +124,28 @@ describe("education extraction — ranges, openness, alternatives", () => {
     assert.equal(eligibility.education.status, "KNOWN");
     assert.equal(eligibility.education.minLevel, "9");
   });
+
+  it("still extracts percentage, age, stream and subjects alongside a list-range", () => {
+    const eligibility = extractEligibility(
+      [
+        "Students studying in Class 8, 9, 10, 11 or 12 are eligible to write the qualifier.",
+        "A minimum of 50% marks in aggregate is required.",
+        "Minimum age is 14 years.",
+      ].join(" "),
+      CTX,
+      {
+        subjectVocabulary: [{ canonical: "Mathematics", match: ["mathematics"] }],
+        streamVocabulary: [{ canonical: "Science", match: ["science"] }],
+      }
+    );
+    assert.equal(eligibility.education.status, "KNOWN");
+    assert.equal(eligibility.education.minLevel, "8");
+    assert.equal(eligibility.education.maxLevel, "12");
+    assert.equal(eligibility.percentage.status, "KNOWN");
+    assert.equal(eligibility.percentage.min, 50);
+    assert.equal(eligibility.age.status, "KNOWN");
+    assert.equal(eligibility.age.min, 14);
+  });
 });
 
 describe("education draft validation — canonical, non-contradictory", () => {

@@ -397,10 +397,48 @@ function extractEligibility(text, ctx = {}, vocab = {}) {
     }
   }
 
+  // --- education comma-list ("Class 8, 9, 10, 11 or 12") --------------------
+  // Bare numbers never match level signals on their own (precision: dates,
+  // ages, paper numbers all contain bare numbers). Inside an explicit
+  // comma/and/or list following "Class"/"Classes" they do: a consecutive run
+  // is a KNOWN bounded range; a non-consecutive list is ambiguous and goes to
+  // human review instead of guessing which in-betweens qualify.
+  if (!rangedEducation) {
+    const listMatch =
+      /class(?:es)?\s+(\d{1,2}(?:\s*(?:,|and|or)\s*(?:class\s*)?\d{1,2})+)/i.exec(
+        collapsed
+      );
+    if (listMatch && nearRequirement(listMatch.index, listMatch[0].length)) {
+      const nums = listMatch[0].match(/\d{1,2}/g) || [];
+      const levels = [
+        ...new Set(nums.filter((n) => EDUCATION_RANK[n] !== undefined)),
+      ].sort((a, b) => EDUCATION_RANK[a] - EDUCATION_RANK[b]);
+      if (levels.length >= 2) {
+        const run = levels.every(
+          (lv, i) => i === 0 || EDUCATION_RANK[lv] === EDUCATION_RANK[levels[i - 1]] + 1
+        );
+        rangedEducation = run
+          ? {
+              lo: levels[0],
+              hi: levels[levels.length - 1],
+              contradictory: false,
+              excerpt: windowAround(collapsed, listMatch.index),
+            }
+          : {
+              lo: null,
+              hi: null,
+              contradictory: "ambiguous-list",
+              excerpt: windowAround(collapsed, listMatch.index),
+            };
+      }
+    }
+  }
+
   if (rangedEducation) {
     if (rangedEducation.contradictory) {
-      // "Class 12 to 8" style text states no coherent range — flag for
-      // verification instead of publishing either end as fact.
+      // "Class 12 to 8" style text — or a non-consecutive class list — states
+      // no coherent range: flag for verification instead of publishing either
+      // end as fact.
       eligibility.education = {
         minLevel: null,
         maxLevel: null,

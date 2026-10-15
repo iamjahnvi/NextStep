@@ -136,6 +136,16 @@ const seedDatabase = async ({ dryRun = DRY_RUN, mongoUri = process.env.MONGO_URI
             if (!dryRun) {
                 // eslint-disable-next-line no-await-in-loop
                 await Exam.updateOne({ _id: existing._id }, { $set: payload });
+                // Drop superseded legacy keys so two sources of truth can
+                // never disagree (their meaning now lives in the education
+                // trio above; values were verified consistent before removal).
+                // NOTE: driver-level update — Mongoose strict mode would
+                // silently strip these non-schema paths from the update above.
+                // eslint-disable-next-line no-await-in-loop
+                await Exam.collection.updateOne(
+                    { _id: existing._id },
+                    { $unset: { educationLevel: "", lastVerifiedAt: "" } }
+                );
             }
             summary.updatedSeed += 1;
         }

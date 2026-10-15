@@ -543,9 +543,13 @@ describe("seed safety — idempotent, non-destructive, manual-preserving", () =>
     });
 
     it("legacy records missing the new fields are backfilled, users untouched", async () => {
-        await Exam.create({
+        // Raw insert: legacy shape with superseded keys no current schema
+        // path accepts (Mongoose strict mode would drop them on create).
+        await Exam.collection.insertOne({
             name: "NTSE",
             fullForm: "National Talent Search Examination",
+            educationLevel: "10",
+            lastVerifiedAt: new Date("2026-10-01"),
             minimumEducationLevel: "10",
             registrationStartDate: new Date("2026-08-01"),
             registrationEndDate: new Date("2026-09-15"),
@@ -557,6 +561,11 @@ describe("seed safety — idempotent, non-destructive, manual-preserving", () =>
         assert.equal(summary.inserted, 49);
         const ntse = await Exam.findOne({ name: "NTSE" });
         assert.equal(ntse.maximumEducationLevel, "10");
+        // Superseded legacy keys are removed (driver-level unset — Mongoose
+        // strict mode silently drops non-schema paths from updates).
+        const raw = await Exam.collection.findOne({ name: "NTSE" });
+        assert.equal("educationLevel" in raw, false);
+        assert.equal("lastVerifiedAt" in raw, false);
         assert.equal(await Exam.countDocuments(), 50);
     });
 });
